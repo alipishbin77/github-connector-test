@@ -1,0 +1,50 @@
+# Render Blueprint: Dashboard -> New -> Blueprint -> pick this repo.
+# Creates the clearinghouse (Docker), managed PostgreSQL and Redis-compatible Key Value.
+# Secrets marked `sync: false` are prompted for on first deploy.
+services:
+  - type: web
+    name: aether-clearinghouse
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /healthz
+    autoDeploy: true            # every merge to main redeploys
+    envVars:
+      - key: AETHER_DATABASE_URL
+        fromDatabase:
+          name: aether-db
+          property: connectionString
+      - key: AETHER_REDIS_URL
+        fromService:
+          type: keyvalue
+          name: aether-redis
+          property: connectionString
+      - key: AETHER_SANDBOX_MODE
+        value: "false"
+      - key: AETHER_FEE_BPS
+        value: "500"            # 5% clearing fee on seller proceeds; tune to taste
+      - key: AETHER_ADMIN_TOKEN
+        generateValue: true     # read it in the dashboard; gates /v1/admin/* and registration
+      - key: AETHER_JWT_PRIVATE_KEY_PEM
+        sync: false             # output of: python -m app.keygen
+      - key: AETHER_JWT_ISSUER
+        sync: false             # e.g. https://api.yourdomain.com
+      - key: AETHER_PUBLIC_BASE_URL
+        sync: false             # same public URL; used for Stripe redirect URLs
+      - key: AETHER_STRIPE_SECRET_KEY
+        sync: false             # sk_live_... (Stripe Connect platform account)
+      - key: AETHER_STRIPE_WEBHOOK_SECRET
+        sync: false             # whsec_... for <public url>/v1/billing/stripe/webhook
+      - key: AETHER_CORS_ORIGINS
+        value: '[]'
+
+  - type: keyvalue
+    name: aether-redis
+    plan: starter
+    maxmemoryPolicy: noeviction # order book + match stream must never be evicted
+    ipAllowList: []             # private network only
+
+databases:
+  - name: aether-db
+    plan: basic-256mb
+    postgresMajorVersion: "16"
