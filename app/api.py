@@ -1,9 +1,11 @@
 """Agent registry, order entry, market data, allocations and ledger endpoints."""
 
 import asyncio
+import hmac
 import ipaddress
 import socket
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 from urllib.parse import urlparse
@@ -24,10 +26,11 @@ from .auth import (
     check_scopes,
     generate_client_credentials,
     hash_secret,
+    make_api_key,
     require_scopes,
 )
 from .config import settings
-from .db import SessionLocal, get_session
+from .db import SessionLocal, get_session, utcnow
 from .exchange import ExchangeError, cancel_order, place_order, release_trade
 from .models import (
     ASK,
@@ -39,6 +42,7 @@ from .models import (
     ORDER_OPEN,
     TRADE_ACTIVE,
     Agent,
+    InferenceJob,
     Order,
     Trade,
     TradeLedger,
@@ -74,6 +78,7 @@ class RegisterAgentOut(BaseModel):
     agent_id: str
     client_id: str
     client_secret: str = Field(description="shown once; only a scrypt hash is stored")
+    api_key: str = Field(description="'<client_id>.<client_secret>' for OpenAI-style clients; shown once")
     scopes: list[str]
 
 
@@ -207,11 +212,26 @@ def agent_out(a: Agent) -> AgentOut:
 @router.post("/agents", response_model=RegisterAgentOut, status_code=201, tags=["agents"])
 async def register_agent(
     body: RegisterAgentIn,
+    request: Request,
     session: AsyncSession = Depends(get_session),
     x_admin_token: str | None = Header(None),
 ):
-    if not settings.sandbox_mode and (not settings.admin_token or x_admin_token != settings.admin_token):
-        raise HTTPException(403, detail="agent registration requires X-Admin-Token outside sandbox mode")
+    """Self-serve signup for agents. New agents start with a zero balance; buyers
+    fund via Stripe deposits, sellers are paid out only after Stripe KYC."""
+    is_admin = (
+        bool(settings.admin_token) and x_admin_token is not None and hmac.compare_digest(x_admin_token, settings.admin_token)
+    )
+    if not (settings.sandbox_mode or settings.open_registration or is_admin):
+        raise HTTPException(403, detail="registration is invite-only on this clearinghouse (X-Admin-Token)")
+    if not is_admin and settings.registrations_per_ip_per_hour > 0:
+        ip = request.client.host if request.client else "unknown"
+        key = f"{settings.redis_prefix}:rl:register:{ip}:{int(time.time() // 3600)}"
+        pipe = request.app.state.redis.pipeline(transaction=True)
+        pipe.incr(key)
+        pipe.expire(key, 3700)
+        count, _ = await pipe.execute()
+        if count > settings.registrations_per_ip_per_hour:
+            raise HTTPException(429, detail="too many registrations from this address; try again later")
     client_id, client_secret = generate_client_credentials()
     secret_hash = await asyncio.to_thread(hash_secret, client_secret)
     agent = Agent(
@@ -226,7 +246,32 @@ async def register_agent(
     )
     session.add(agent)
     await session.commit()
-    return RegisterAgentOut(agent_id=agent.id, client_id=client_id, client_secret=client_secret, scopes=body.scopes)
+    return RegisterAgentOut(
+        agent_id=agent.id,
+        client_id=client_id,
+        client_secret=client_secret,
+        api_key=make_api_key(client_id, client_secret),
+        scopes=body.scopes,
+    )
+
+
+@router.post("/agents/me/rotate-secret", response_model=RegisterAgentOut, tags=["agents"])
+async def rotate_secret(ctx: AuthContext = Depends(authenticate)):
+    """Issue a new client secret. The old secret, API key and every JWT issued
+    so far stop working immediately."""
+    _, client_secret = generate_client_credentials()
+    secret_hash = await asyncio.to_thread(hash_secret, client_secret)
+    async with SessionLocal() as session, session.begin():
+        agent = (await session.execute(select(Agent).where(Agent.id == ctx.agent_id).with_for_update())).scalar_one()
+        agent.client_secret_hash = secret_hash
+        agent.token_version += 1
+    return RegisterAgentOut(
+        agent_id=agent.id,
+        client_id=agent.client_id,
+        client_secret=client_secret,
+        api_key=make_api_key(agent.client_id, client_secret),
+        scopes=sorted(agent.scopes),
+    )
 
 
 @router.get("/agents/me", response_model=AgentOut, tags=["agents"])
@@ -419,11 +464,58 @@ async def my_ledger(
     ]
 
 
-@router.get("/audit", tags=["sandbox"])
-async def audit(session: AsyncSession = Depends(get_session)):
-    """Global accounting invariants (sandbox only)."""
-    if not settings.sandbox_mode:
+def _admin_or_sandbox(x_admin_token: str | None) -> None:
+    is_admin = (
+        bool(settings.admin_token) and x_admin_token is not None and hmac.compare_digest(x_admin_token, settings.admin_token)
+    )
+    if not (settings.sandbox_mode or is_admin):
         raise HTTPException(404, detail="not found")
+
+
+@router.get("/admin/stats", tags=["admin"])
+async def admin_stats(session: AsyncSession = Depends(get_session), x_admin_token: str | None = Header(None)):
+    """Operator dashboard numbers: revenue, volume, money in/out, activity."""
+    _admin_or_sandbox(x_admin_token)
+    by_account = dict(
+        (
+            await session.execute(select(TradeLedger.account, func.sum(TradeLedger.amount_nanos)).group_by(TradeLedger.account))
+        ).all()
+    )
+    since = utcnow() - timedelta(hours=24)
+    jobs = dict(
+        (
+            await session.execute(
+                select(InferenceJob.status, func.count()).where(InferenceJob.created_at >= since).group_by(InferenceJob.status)
+            )
+        ).all()
+    )
+    trades = (
+        await session.execute(
+            select(
+                func.count(), func.coalesce(func.sum(Trade.gross_settled_nanos), 0), func.coalesce(func.sum(Trade.tokens_used), 0)
+            )
+        )
+    ).one()
+    agents = (await session.execute(select(func.count()).select_from(Agent))).scalar_one()
+    sellers = (await session.execute(select(func.count()).select_from(Agent).where(Agent.endpoint_url.is_not(None)))).scalar_one()
+    return {
+        "revenue_fees_usd": fmt_usd(int(by_account.get(ledger.HOUSE_FEES, 0))),
+        "settled_volume_usd": fmt_usd(int(trades[1])),
+        "tokens_delivered": int(trades[2]),
+        "trades": int(trades[0]),
+        "deposits_usd": fmt_usd(-int(by_account.get(ledger.HOUSE_STRIPE_IN, 0))),
+        "payouts_usd": fmt_usd(int(by_account.get(ledger.HOUSE_STRIPE_OUT, 0))),
+        "sandbox_minted_usd": fmt_usd(-int(by_account.get(ledger.HOUSE_MINT, 0))),
+        "agents": agents,
+        "sellers_with_endpoint": sellers,
+        "jobs_24h": jobs,
+    }
+
+
+@router.get("/audit", tags=["admin"])
+async def audit(session: AsyncSession = Depends(get_session), x_admin_token: str | None = Header(None)):
+    """Global accounting invariants (sandbox, or with X-Admin-Token)."""
+    _admin_or_sandbox(x_admin_token)
     total = (await session.execute(select(func.coalesce(func.sum(TradeLedger.amount_nanos), 0)))).scalar_one()
     unbalanced = (
         (

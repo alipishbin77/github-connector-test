@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from redis.asyncio import ConnectionPool, Redis
 from sqlalchemy import text
 
-from . import api, auth, proxy_router
+from . import api, auth, openai_compat, payments, proxy_router
 from .config import settings
 from .db import engine as db_engine
 from .db import init_models
@@ -53,6 +53,8 @@ async def lifespan(app: FastAPI):
         follow_redirects=False,  # never let a seller bounce the delivery token elsewhere
     )
 
+    app.state.stripe = payments.StripeClient.create()
+
     # Crash recovery: apply unapplied match events, then make the Redis book
     # agree with PostgreSQL before accepting orders.
     worker = SettlementWorker(redis, app.state.engine)
@@ -63,7 +65,12 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(worker.run(), name="settlement-worker"),
         asyncio.create_task(maintenance_loop(app), name="maintenance"),
     ]
-    log.info("Aether clearinghouse ready (sandbox=%s, fee=%sbps)", settings.sandbox_mode, settings.fee_bps)
+    log.info(
+        "Aether clearinghouse ready (sandbox=%s, fee=%sbps, payments=%s)",
+        settings.sandbox_mode,
+        settings.fee_bps,
+        "stripe" if app.state.stripe else "off",
+    )
     try:
         yield
     finally:
@@ -74,6 +81,8 @@ async def lifespan(app: FastAPI):
                 await t
         await proxy_router.drain_background()
         await app.state.http.aclose()
+        if app.state.stripe is not None:
+            await app.state.stripe.aclose()
         await redis.aclose()
         await pool.disconnect()
         await db_engine.dispose()
@@ -95,6 +104,8 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(api.router)
 app.include_router(proxy_router.router)
+app.include_router(openai_compat.router)
+app.include_router(payments.router)
 
 
 @app.get("/healthz", tags=["ops"])

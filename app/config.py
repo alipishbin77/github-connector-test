@@ -1,5 +1,6 @@
 """Runtime configuration. Every field can be overridden with an AETHER_* env var."""
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,6 +29,9 @@ class Settings(BaseSettings):
     default_ask_ttl_s: int = 3600
     max_order_tokens: int = 10**12
     max_fills_per_match: int = 256
+    # OpenAI-compatible endpoint defaults
+    default_completion_tokens: int = 512
+    default_max_price_usd_per_mtok: str = "5.00"  # auto-buy price cap when the agent sends none
     match_stream_maxlen: int = 1_000_000
 
     # Proxy router
@@ -44,12 +48,34 @@ class Settings(BaseSettings):
     # Background workers
     sweep_interval_s: float = 2.0
 
+    # Real-money rails (Stripe). Unset => billing endpoints return 503.
+    public_base_url: str = "http://localhost:8000"
+    stripe_secret_key: str | None = None
+    stripe_webhook_secret: str | None = None
+    stripe_api_base: str = "https://api.stripe.com"
+    min_deposit_usd: int = 5
+    max_deposit_usd: int = 10_000
+    min_withdrawal_usd: int = 10
+
     # Security / sandbox
-    sandbox_mode: bool = True  # open registration + faucet + audit endpoint
-    admin_token: str | None = None  # required for registration when sandbox_mode is off
+    # Production-safe defaults; docker-compose and tests opt into the sandbox explicitly.
+    sandbox_mode: bool = False  # open registration + faucet + audit endpoint
+    admin_token: str | None = None  # gates /v1/admin/*, and registration when open_registration is off
+    open_registration: bool = True  # agents self-register (zero balance until they deposit)
+    registrations_per_ip_per_hour: int = 20
     max_faucet_usd: float = 100.0
-    allow_private_seller_urls: bool = True  # SSRF guard; set False in production
+    allow_private_seller_urls: bool = False  # SSRF guard: sellers must be public https endpoints
     cors_origins: list[str] = ["*"]
+    rate_limit_per_minute: int = 1200  # per agent, all authenticated endpoints; 0 disables
+
+    @field_validator("database_url")
+    @classmethod
+    def _async_driver(cls, v: str) -> str:
+        # Managed Postgres (Render, Heroku, Fly, Neon...) hands out postgres:// URLs.
+        for prefix in ("postgres://", "postgresql://"):
+            if v.startswith(prefix):
+                return "postgresql+asyncpg://" + v[len(prefix) :]
+        return v
 
 
 settings = Settings()

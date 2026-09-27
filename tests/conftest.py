@@ -41,6 +41,9 @@ os.environ["AETHER_REDIS_URL"] = redis_url
 os.environ["AETHER_REDIS_PREFIX"] = f"aethertest{uuid.uuid4().hex[:8]}"
 os.environ["AETHER_RETRY_BACKOFF_BASE_S"] = "0.01"
 os.environ["AETHER_SWEEP_INTERVAL_S"] = "0.2"
+os.environ["AETHER_SANDBOX_MODE"] = "true"
+os.environ["AETHER_ALLOW_PRIVATE_SELLER_URLS"] = "true"
+os.environ["AETHER_REGISTRATIONS_PER_IP_PER_HOUR"] = "0"
 
 
 def pytest_sessionfinish(session, exitstatus):

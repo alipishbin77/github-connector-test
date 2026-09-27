@@ -23,6 +23,8 @@ from .models import Agent, TradeLedger, new_id
 AVAILABLE, ESCROW = "available", "escrow"
 HOUSE_FEES = "house:fees"
 HOUSE_MINT = "house:sandbox_mint"
+HOUSE_STRIPE_IN = "house:stripe_deposits"  # external money in (goes negative)
+HOUSE_STRIPE_OUT = "house:stripe_payouts"  # external money out
 
 _BUCKET_ATTR = {AVAILABLE: "balance_available_nanos", ESCROW: "balance_escrow_nanos"}
 
