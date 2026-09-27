@@ -12,9 +12,14 @@ moves, the launch checklist, and the roadmap.
 
 ```python
 from openai import OpenAI
+
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="<client_id>.<client_secret>")  # api_key from POST /v1/agents
-client.chat.completions.create(model="llama-3.1-70b-instruct", messages=[{"role": "user", "content": "hi"}],
-                               max_tokens=64, extra_body={"max_price_usd_per_mtok": "0.50"})
+client.chat.completions.create(
+    model="llama-3.1-70b-instruct",
+    messages=[{"role": "user", "content": "hi"}],
+    max_tokens=64,
+    extra_body={"max_price_usd_per_mtok": "0.50"},
+)
 ```
 
 Each call market-buys any missing capacity within the price cap, escrows it, streams the answer, and settles per
