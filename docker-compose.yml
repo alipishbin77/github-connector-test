@@ -1,0 +1,128 @@
+name: aether
+
+x-app: &app
+  build: .
+  image: aether-app:0.1.0
+  restart: unless-stopped
+
+x-healthcheck: &http-health
+  interval: 3s
+  timeout: 3s
+  retries: 30
+  start_period: 5s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aether
+      POSTGRES_PASSWORD: aether
+      POSTGRES_DB: aether
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aether -d aether"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    # AOF so the match stream (durable fill log) survives a Redis restart
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  clearinghouse:
+    <<: *app
+    environment:
+      AETHER_DATABASE_URL: postgresql+asyncpg://aether:aether@postgres:5432/aether
+      AETHER_REDIS_URL: redis://redis:6379/0
+      AETHER_JWT_KEY_FILE: /data/jwt-signing-key.pem
+      AETHER_JWT_ISSUER: http://clearinghouse:8000
+      AETHER_SANDBOX_MODE: "true"
+      AETHER_FEE_BPS: "100"
+    ports:
+      - "8000:8000"
+    volumes:
+      - keys:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
+
+  # Cheap spot capacity on a flaky instance: reclaimed after 25 tokens on the
+  # first two attempts of every job -> exercises resume + failover.
+  seller-a:
+    <<: *app
+    command: ["python", "-m", "app.seller_agent_sim"]
+    environment:
+      CLEARINGHOUSE_URL: http://clearinghouse:8000
+      SELLER_NAME: seller-a
+      SELLER_PORT: "9001"
+      SELLER_PUBLIC_URL: http://seller-a:9001/v1/generate
+      INSTRUMENT: llama-3.1-70b-instruct
+      PRICE_USD_PER_MTOK: "0.35"
+      CAPACITY_TOKENS: "400"
+      PREEMPT_AFTER_TOKENS: "25"
+      PREEMPT_ATTEMPTS: "2"
+      TOKEN_DELAY_MS: "15"
+    depends_on:
+      clearinghouse:
+        condition: service_healthy
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9001/healthz', timeout=2)"]
+
+  # Pricier, reliable capacity.
+  seller-b:
+    <<: *app
+    command: ["python", "-m", "app.seller_agent_sim"]
+    environment:
+      CLEARINGHOUSE_URL: http://clearinghouse:8000
+      SELLER_NAME: seller-b
+      SELLER_PORT: "9002"
+      SELLER_PUBLIC_URL: http://seller-b:9002/v1/generate
+      INSTRUMENT: llama-3.1-70b-instruct
+      PRICE_USD_PER_MTOK: "0.40"
+      CAPACITY_TOKENS: "5000"
+      TOKEN_DELAY_MS: "15"
+    depends_on:
+      clearinghouse:
+        condition: service_healthy
+    healthcheck:
+      <<: *http-health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9002/healthz', timeout=2)"]
+
+  buyer:
+    <<: *app
+    restart: "no"
+    profiles: ["sim"]
+    command: ["python", "-m", "app.buyer_agent_sim"]
+    environment:
+      CLEARINGHOUSE_URL: http://clearinghouse:8000
+      INSTRUMENT: llama-3.1-70b-instruct
+      BUY_TOKENS: "1000"
+      MAX_PRICE_USD_PER_MTOK: "0.50"
+      JOBS: "3"
+      MAX_TOKENS: "150"
+      FORCE_COLOR: "1"
+    depends_on:
+      seller-a:
+        condition: service_healthy
+      seller-b:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+  keys:
