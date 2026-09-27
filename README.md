@@ -138,7 +138,7 @@ Delivery token (proxy → seller, one per seller call):
 
 ```bash
 docker compose up -d --build --wait      # postgres, redis, clearinghouse, seller-a, seller-b
-docker compose run --rm buyer            # the buyer agent's end-to-end simulation
+docker compose run --rm --no-deps buyer  # the buyer agent's end-to-end simulation
 docker compose logs -f clearinghouse seller-a
 open http://localhost:8000/docs          # OpenAPI UI
 docker compose down -v                   # tear down, wiping volumes
@@ -151,7 +151,7 @@ python -m venv .venv && . .venv/bin/activate && pip install -r requirements-dev.
 pytest -q
 ```
 
-### Expected output (from an actual `docker compose run --rm buyer`, abridged)
+### Expected output (from an actual `docker compose run --rm --no-deps buyer`, abridged)
 
 ```
 == 2. The M2M boundary holds =============================================

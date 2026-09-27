@@ -1,9 +1,9 @@
 name: aether
 
 # Only the clearinghouse builds the image; every other app service reuses it.
-# (If each service had its own `build:`, `docker compose run buyer` would
-# rebuild the tag and Compose would recreate the running sellers, which then
-# re-register as new agents while their old asks are still on the book.)
+# Run the buyer with `docker compose run --rm --no-deps buyer`: without
+# --no-deps some Compose versions recreate the running sellers, which then
+# re-register as new agents while their old asks are still on the book.
 x-app: &app
   image: aether-app:0.1.0
   pull_policy: never
