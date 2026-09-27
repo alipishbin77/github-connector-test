@@ -38,7 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker compose up -d --build --wait
-      - run: docker compose run --rm buyer
+      - run: docker compose run --rm --no-deps buyer
       - if: failure()
         run: docker compose logs --no-color
       - if: always()
