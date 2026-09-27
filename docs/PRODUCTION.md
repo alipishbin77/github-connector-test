@@ -37,12 +37,13 @@ proves that the ledger sums to zero and that all escrow is backed.
 
 ```python
 from openai import OpenAI
+
 client = OpenAI(base_url="https://api.yourdomain.com/v1", api_key="agt_cli_….aes_…")
 r = client.chat.completions.create(
     model="llama-3.1-70b-instruct",
     messages=[{"role": "user", "content": "Summarise this contract…"}],
     max_tokens=400,
-    extra_body={"max_price_usd_per_mtok": "0.60"},   # optional price cap
+    extra_body={"max_price_usd_per_mtok": "0.60"},  # optional price cap
 )
 print(r.choices[0].message.content, r.usage, r.model_extra["aether"]["cost_usd"])
 ```
