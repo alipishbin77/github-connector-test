@@ -1,8 +1,12 @@
 name: aether
 
+# Only the clearinghouse builds the image; every other app service reuses it.
+# (If each service had its own `build:`, `docker compose run buyer` would
+# rebuild the tag and Compose would recreate the running sellers, which then
+# re-register as new agents while their old asks are still on the book.)
 x-app: &app
-  build: .
   image: aether-app:0.1.0
+  pull_policy: never
   restart: unless-stopped
 
 x-healthcheck: &http-health
@@ -40,6 +44,7 @@ services:
 
   clearinghouse:
     <<: *app
+    build: .
     environment:
       AETHER_DATABASE_URL: postgresql+asyncpg://aether:aether@postgres:5432/aether
       AETHER_REDIS_URL: redis://redis:6379/0
