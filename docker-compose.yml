@@ -1,8 +1,12 @@
 name: aether
 
+# Only the clearinghouse builds the image; every other app service reuses it.
+# Run the buyer with `docker compose run --rm --no-deps buyer`: without
+# --no-deps some Compose versions recreate the running sellers, which then
+# re-register as new agents while their old asks are still on the book.
 x-app: &app
-  build: .
   image: aether-app:0.1.0
+  pull_policy: never
   restart: unless-stopped
 
 x-healthcheck: &http-health
@@ -40,12 +44,14 @@ services:
 
   clearinghouse:
     <<: *app
+    build: .
     environment:
       AETHER_DATABASE_URL: postgresql+asyncpg://aether:aether@postgres:5432/aether
       AETHER_REDIS_URL: redis://redis:6379/0
       AETHER_JWT_KEY_FILE: /data/jwt-signing-key.pem
       AETHER_JWT_ISSUER: http://clearinghouse:8000
       AETHER_SANDBOX_MODE: "true"
+      AETHER_ALLOW_PRIVATE_SELLER_URLS: "true"  # simulated sellers live on the compose network
       AETHER_FEE_BPS: "100"
     ports:
       - "8000:8000"

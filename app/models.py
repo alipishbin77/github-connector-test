@@ -42,6 +42,7 @@ TRADE_ACTIVE, TRADE_EXHAUSTED, TRADE_RELEASED, TRADE_EXPIRED = "active", "exhaus
 
 # Inference job states
 JOB_STREAMING, JOB_COMPLETED, JOB_FAILED = "streaming", "completed", "failed"
+JOB_REJECTED = "rejected"  # never routed: escrow gate refused it
 
 
 class Agent(Base):
@@ -189,3 +190,38 @@ class InferenceJob(Base):
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ExternalPayment(Base):
+    """A settled deposit from an external rail (Stripe Checkout). The primary
+    key is the provider's object id, which makes webhook crediting idempotent."""
+
+    __tablename__ = "external_payments"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    provider: Mapped[str] = mapped_column(String(16))
+    amount_nanos: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PayoutAccount(Base):
+    """Seller's connected payout account (Stripe Connect Express)."""
+
+    __tablename__ = "payout_accounts"
+
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), primary_key=True)
+    stripe_account_id: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Withdrawal(Base):
+    __tablename__ = "withdrawals"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("wd"))
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    amount_nanos: Mapped[int] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(16))  # pending|paid|failed
+    stripe_transfer_id: Mapped[str | None] = mapped_column(String(64))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

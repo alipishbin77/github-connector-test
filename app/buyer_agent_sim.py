@@ -6,7 +6,8 @@
   4. read the order book, send a market bid with a price cap (escrowed first)
   5. stream several concurrent inference jobs through the proxy router,
      surviving simulated spot preemption via checkpoint-resume / failover
-  6. release unused allocations and print the micro-transaction ledger + audit
+  6. release unused allocations and print the micro-transaction ledger
+  7. make the same kind of call through the OpenAI-compatible endpoint + audit
 
 Run:  python -m app.buyer_agent_sim
 """
@@ -200,7 +201,29 @@ async def main() -> int:
         me = (await c.get("/v1/agents/me", headers=H)).json()
         print(f"final wallet: available={me['available_usd']} escrow={me['escrow_usd']}")
 
-        step("9. Clearinghouse audit (double-entry invariants)")
+        step("9. Drop-in OpenAI-compatible call (static API key, auto-buy)")
+        K = {"Authorization": f"Bearer {reg['api_key']}"}
+        r = await c.post(
+            "/v1/chat/completions",
+            headers=K,
+            json={
+                "model": INSTRUMENT,
+                "messages": [{"role": "user", "content": "One line on why spot inference markets matter."}],
+                "max_tokens": 40,
+                "max_price_usd_per_mtok": MAX_PRICE,
+            },
+            timeout=60,
+        )
+        r.raise_for_status()
+        chat = r.json()
+        print(
+            f"POST /v1/chat/completions model={chat['model']} -> finish={chat['choices'][0]['finish_reason']} "
+            f"usage={chat['usage']} cost={chat['aether']['cost_usd']}"
+        )
+        print(f"{DIM}{chat['choices'][0]['message']['content'][:140]}…{RESET}")
+        results.append({"event": "done"} if chat["choices"][0]["finish_reason"] else {})
+
+        step("10. Clearinghouse audit (double-entry invariants)")
         audit = (await c.get("/v1/audit")).json()
         print(json.dumps(audit, indent=2))
         ok = audit["ok"] and all(r.get("event") == "done" for r in results)

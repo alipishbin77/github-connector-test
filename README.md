@@ -5,6 +5,26 @@ double-auction spot market. **Credentials never change hands.** Buyers hold escr
 proxies every request to the seller's own stateless endpoint using a single-use, body-bound delivery JWT. Sellers are paid
 in nano-dollars for exactly the tokens the proxy streamed.
 
+**Going to production:** see [docs/PRODUCTION.md](docs/PRODUCTION.md) for what the live platform does, how money
+moves, the launch checklist, and the roadmap.
+
+**Agents can connect with any OpenAI-compatible client:**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="<client_id>.<client_secret>")  # api_key from POST /v1/agents
+client.chat.completions.create(
+    model="llama-3.1-70b-instruct",
+    messages=[{"role": "user", "content": "hi"}],
+    max_tokens=64,
+    extra_body={"max_price_usd_per_mtok": "0.50"},
+)
+```
+
+Each call market-buys any missing capacity within the price cap, escrows it, streams the answer, and settles per
+delivered token.
+
 > **Scope note.** Abstracting keys behind a proxy does **not** by itself make it permissible to resell a proprietary API
 > (OpenAI, Anthropic, Google…). If a seller's endpoint just forwards to their own vendor key, that is still resale of
 > access, which those providers' terms generally prohibit. The model this MVP is built for is sellers running models they
@@ -104,16 +124,21 @@ Delivery token (proxy → seller, one per seller call):
 | `app/proxy_router.py` | Escrow gate, delivery-token minting, async SSE relay, checkpoint/resume/failover, settlement, orphan recovery |
 | `app/ledger.py` | Double-entry postings with row-locked balance checks |
 | `app/api.py` | Agent registry, faucet, orders, book, market-data SSE, allocations, ledger, audit |
+| `app/openai_compat.py` | OpenAI-compatible `/v1/chat/completions` (streaming + usage), `/v1/models`, `/v1/quote`, auto-buy |
+| `app/payments.py` | Stripe Checkout deposits (signed, idempotent webhook), Stripe Connect onboarding and payouts |
+| `app/seller_gateway.py` | **Production seller**: fronts your vLLM/SGLang/TGI server, keeps an ask listed, verifies delivery JWTs, resumes from prefix |
+| `app/keygen.py` | Generates the RS256 key for `AETHER_JWT_PRIVATE_KEY_PEM` |
+| `render.yaml`, `.github/workflows/ci.yml` | One-click Render deploy (app, Postgres, Key Value); CI running lint, tests and Docker end-to-end |
 | `app/seller_agent_sim.py` | Mock seller: self-registers, lists capacity, verifies delivery JWTs, serves SSE, simulates spot preemption |
 | `app/buyer_agent_sim.py` | Mock buyer: the full M2M negotiation end to end |
 | `Dockerfile`, `docker-compose.yml` | App image, plus Postgres 16, Redis 7 (AOF), clearinghouse, `seller-a` (cheap, flaky), `seller-b` (reliable), `buyer` |
-| `tests/` | 18 async tests: priority, escrow, IOC, cancel, expiry, auth, resume, failover, overdraw races, orphan recovery |
+| `tests/` | 32 async tests: matching, escrow, auth, API keys, rate limits, resume, failover, rollover, overdraw races, orphan recovery, OpenAI format, Stripe deposits and payouts, seller gateway |
 
 ## Running it
 
 ```bash
 docker compose up -d --build --wait      # postgres, redis, clearinghouse, seller-a, seller-b
-docker compose run --rm buyer            # the buyer agent's end-to-end simulation
+docker compose run --rm --no-deps buyer  # the buyer agent's end-to-end simulation
 docker compose logs -f clearinghouse seller-a
 open http://localhost:8000/docs          # OpenAPI UI
 docker compose down -v                   # tear down, wiping volumes
@@ -126,7 +151,7 @@ python -m venv .venv && . .venv/bin/activate && pip install -r requirements-dev.
 pytest -q
 ```
 
-### Expected output (from an actual `docker compose run --rm buyer`, abridged)
+### Expected output (from an actual `docker compose run --rm --no-deps buyer`, abridged)
 
 ```
 == 2. The M2M boundary holds =============================================
@@ -192,17 +217,23 @@ aether.proxy: SETTLED job=job_0d41… tokens=150 cost=$0.000057500 segments=[('t
 | `POST /v1/inference` | `buy_inference` | SSE events: `meta`, token `data`, `resume`, `done` / `error` |
 | `GET /v1/jobs/{id}` | `buy_inference` | Status plus checkpointed text (recovers output if the buyer's connection dropped) |
 | `GET /v1/trades`, `POST /v1/trades/{id}/release` | any / `buy_inference` | Allocations; release refunds unused escrow |
-| `GET /v1/ledger`, `GET /v1/audit`, `POST /v1/sandbox/faucet` | any / sandbox | Ledger entries, invariants, test money |
+| `POST /v1/chat/completions`, `GET /v1/models`, `GET /v1/quote/{model}` | `buy_inference` / public | OpenAI-compatible; `max_price_usd_per_mtok` and `auto_buy` extensions |
+| `POST /v1/agents/me/rotate-secret` | any | New secret; old secret, API key and JWTs stop working |
+| `POST /v1/billing/deposits`, `POST /v1/billing/stripe/webhook` | any / Stripe-signed | Card top-ups via Stripe Checkout |
+| `POST /v1/billing/connect/onboard`, `POST/GET /v1/billing/withdrawals` | `sell_compute` | Stripe Connect KYC and payouts |
+| `GET /v1/ledger` | any | The agent's ledger entries |
+| `GET /v1/audit`, `GET /v1/admin/stats` | sandbox or `X-Admin-Token` | Invariants; revenue, volume and activity |
+| `POST /v1/sandbox/faucet` | sandbox only | Test money |
 
 ## Known gaps before real money
 
-- **Metering trust.** The proxy counts SSE token events. A dishonest seller could split output into more "tokens".
-  Production should re-tokenize with the instrument's tokenizer and bill on that count.
-- **Quality and identity of the model.** Nothing yet proves that the seller serves the instrument it listed. This needs
-  spot-check prompts, reputation, and eventually TEE attestation.
-- **No seller collateral or slashing.** Preemption costs the buyer only latency, but capacity that never gets delivered
-  goes unpenalized.
-- **Operations.** Schema is created with `create_all` (use Alembic migrations). The Lua scripts assume a single Redis
-  primary (Cluster needs hash tags). There is no rate limiting.
-- **Regulation.** Holding customer funds in escrow and paying them out to third parties is money transmission in most
-  jurisdictions (KYC/AML, licensing). The sandbox faucet exists precisely so the MVP moves no real money.
+The full list, with priorities, is in [docs/PRODUCTION.md](docs/PRODUCTION.md#engineering-roadmap-in-priority-order).
+The most important:
+
+- **Metering trust.** The proxy counts SSE token events, so a dishonest seller could split output into more "tokens".
+  Billing should use the instrument's tokenizer.
+- **Prompt tokens are not billed yet**, and nothing yet verifies which model a seller actually runs.
+- **Operations.** The schema is created with `create_all` (Alembic migrations needed before the first schema change),
+  and the Lua scripts assume a single Redis primary.
+- **Regulation.** Real money flows through Stripe Connect as the platform, but holding balances and paying sellers
+  still needs a legal review in your jurisdiction.
