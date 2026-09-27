@@ -46,6 +46,7 @@ services:
       AETHER_JWT_KEY_FILE: /data/jwt-signing-key.pem
       AETHER_JWT_ISSUER: http://clearinghouse:8000
       AETHER_SANDBOX_MODE: "true"
+      AETHER_ALLOW_PRIVATE_SELLER_URLS: "true"  # simulated sellers live on the compose network
       AETHER_FEE_BPS: "100"
     ports:
       - "8000:8000"

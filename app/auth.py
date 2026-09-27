@@ -258,12 +258,71 @@ def revoked_key(jti: str) -> str:
 _bearer = HTTPBearer(auto_error=False)
 
 
+API_KEY_PREFIX = "agt_cli_"
+_api_key_cache: dict[str, tuple[str, float]] = {}  # sha256(key) -> (verified secret hash, expiry)
+
+
+def make_api_key(client_id: str, client_secret: str) -> str:
+    """Static API key for OpenAI-style clients: '<client_id>.<client_secret>'."""
+    return f"{client_id}.{client_secret}"
+
+
+async def _authenticate_api_key(key: str) -> AuthContext:
+    client_id, _, secret = key.partition(".")
+    async with SessionLocal() as session:
+        agent = (await session.execute(select(Agent).where(Agent.client_id == client_id))).scalar_one_or_none()
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    cached = _api_key_cache.get(digest)
+    now = time.monotonic()
+    # The cache stores the secret hash that verified, so a rotated secret
+    # invalidates it immediately; scrypt runs at most once a minute per key.
+    if agent is None or not (cached and cached[0] == agent.client_secret_hash and cached[1] > now):
+        valid = await asyncio.to_thread(verify_secret, secret, agent.client_secret_hash if agent else _dummy_hash())
+        if agent is None or not valid:
+            raise _unauthorized("invalid_token", "invalid API key")
+        if len(_api_key_cache) > 10_000:
+            _api_key_cache.clear()
+        _api_key_cache[digest] = (agent.client_secret_hash, now + 60)
+    if not agent.is_active:
+        raise _unauthorized("invalid_token", "agent disabled")
+    return AuthContext(
+        agent_id=agent.id,
+        client_id=agent.client_id,
+        scopes=frozenset(agent.scopes),
+        jti=f"apikey:{agent.client_id}",
+        exp=int(time.time()) + 60,
+    )
+
+
+async def _rate_limit(request: Request, agent_id: str) -> None:
+    limit = settings.rate_limit_per_minute
+    if limit <= 0:
+        return
+    window = int(time.time() // 60)
+    key = f"{settings.redis_prefix}:rl:{agent_id}:{window}"
+    pipe = request.app.state.redis.pipeline(transaction=True)
+    pipe.incr(key)
+    pipe.expire(key, 70)
+    count, _ = await pipe.execute()
+    if count > limit:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"error": "rate_limited", "error_description": f"limit is {limit} requests/minute per agent"},
+            headers={"Retry-After": str(60 - int(time.time()) % 60)},
+        )
+
+
 async def authenticate(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> AuthContext:
+    """Accepts a short-lived JWT access token or a static API key."""
     if creds is None:
         raise _unauthorized("invalid_request", "missing bearer token")
+    if creds.credentials.startswith(API_KEY_PREFIX) and "." in creds.credentials:
+        ctx = await _authenticate_api_key(creds.credentials)
+        await _rate_limit(request, ctx.agent_id)
+        return ctx
     claims = decode_access_token(creds.credentials)
     if await request.app.state.redis.exists(revoked_key(claims["jti"])):
         raise _unauthorized("invalid_token", "token revoked")
@@ -273,6 +332,7 @@ async def authenticate(
         agent = await session.get(Agent, claims["sub"])
     if agent is None or not agent.is_active or agent.token_version != claims.get("tv"):
         raise _unauthorized("invalid_token", "agent disabled or token generation revoked")
+    await _rate_limit(request, agent.id)
     return AuthContext(
         agent_id=agent.id,
         client_id=claims["client_id"],
@@ -352,6 +412,8 @@ async def token_endpoint(
 @router.post("/oauth/revoke")
 async def revoke_endpoint(request: Request, ctx: AuthContext = Depends(authenticate)):
     """Revoke the presented access token (RFC 7009 subset)."""
+    if ctx.jti.startswith("apikey:"):
+        raise HTTPException(400, detail="API keys are revoked by rotating the secret: POST /v1/agents/me/rotate-secret")
     ttl = max(1, ctx.exp - int(time.time()))
     await request.app.state.redis.set(revoked_key(ctx.jti), "1", ex=ttl)
     return {"revoked": ctx.jti}

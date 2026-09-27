@@ -141,6 +141,8 @@ async def place_order(
             order.escrow_nanos = escrow
 
     event = await engine.submit(order, rest=(time_in_force == GTC))
+    if side == ASK:
+        await redis.sadd(f"{settings.redis_prefix}:instruments", instrument)
     await apply_match_event(event, redis)
 
     async with SessionLocal() as session:
@@ -346,44 +348,96 @@ class Segment:
     delivered: int = 0
 
 
-async def reserve_allocation(
-    *, buyer_id: str, instrument: str, tokens: int, trade_id: str | None = None, exclude: set[str] | frozenset = frozenset()
-) -> Segment | None:
-    """Pick the cheapest escrowed allocation that can cover `tokens` and reserve
-    them, so concurrent requests can never overdraw the same allocation."""
+class _NotEnoughCapacity(Exception):
+    pass
+
+
+async def reserve_capacity(
+    *,
+    buyer_id: str,
+    instrument: str,
+    tokens: int,
+    trade_id: str | None = None,
+    exclude: set[str] | frozenset = frozenset(),
+) -> list[Segment] | None:
+    """Atomically reserve `tokens` across the buyer's escrowed allocations,
+    cheapest first. Returns the plan (one Segment per allocation used), or None
+    — reserving nothing — if the allocations cannot cover the full amount.
+    Row locks mean concurrent requests can never overdraw an allocation."""
     now = utcnow()
-    async with SessionLocal() as session, session.begin():
-        query = (
-            select(Trade, Agent.endpoint_url)
-            .join(Agent, Agent.id == Trade.seller_id)
-            .where(
-                Trade.buyer_id == buyer_id,
-                Trade.instrument == instrument,
-                Trade.status == TRADE_ACTIVE,
-                Trade.expires_at > now,
-                Trade.tokens_total - Trade.tokens_used - Trade.tokens_reserved >= tokens,
-                Agent.is_active.is_(True),
-                Agent.endpoint_url.is_not(None),
+    try:
+        async with SessionLocal() as session, session.begin():
+            query = (
+                select(Trade, Agent.endpoint_url)
+                .join(Agent, Agent.id == Trade.seller_id)
+                .where(
+                    Trade.buyer_id == buyer_id,
+                    Trade.instrument == instrument,
+                    Trade.status == TRADE_ACTIVE,
+                    Trade.expires_at > now,
+                    Trade.tokens_total - Trade.tokens_used - Trade.tokens_reserved > 0,
+                    Agent.is_active.is_(True),
+                    Agent.endpoint_url.is_not(None),
+                )
+                # Lock in id order (same as settle_job) to rule out deadlocks,
+                # then consume in price/time order.
+                .order_by(Trade.id)
+                .with_for_update(of=Trade)
             )
-            .order_by(Trade.price_npt, Trade.created_at)
-            .limit(1)
-            # Plain FOR UPDATE (not SKIP LOCKED): under contention we wait a few
-            # microseconds rather than routing to a pricier allocation.
-            .with_for_update(of=Trade)
-        )
-        if trade_id is not None:
-            query = query.where(Trade.id == trade_id)
-        if exclude:
-            query = query.where(Trade.id.not_in(sorted(exclude)))
-        row = (await session.execute(query)).first()
-        if row is None:
-            return None
-        trade, endpoint_url = row
-        if trade.escrow_nanos < trade.price_npt * (trade.tokens_total - trade.tokens_used):
-            log.error("allocation %s is under-escrowed; refusing to route", trade.id)
-            return None
-        trade.tokens_reserved += tokens
-        return Segment(trade.id, trade.seller_id, endpoint_url, trade.price_npt, tokens)
+            if trade_id is not None:
+                query = query.where(Trade.id == trade_id)
+            if exclude:
+                query = query.where(Trade.id.not_in(sorted(exclude)))
+            rows = sorted((await session.execute(query)).all(), key=lambda r: (r[0].price_npt, r[0].created_at, r[0].id))
+            plan: list[Segment] = []
+            need = tokens
+            for trade, endpoint_url in rows:
+                if trade.escrow_nanos < trade.price_npt * (trade.tokens_total - trade.tokens_used):
+                    log.error("allocation %s is under-escrowed; refusing to route", trade.id)
+                    continue
+                take = min(trade.tokens_available, need)
+                trade.tokens_reserved += take
+                plan.append(Segment(trade.id, trade.seller_id, endpoint_url, trade.price_npt, take))
+                need -= take
+                if need == 0:
+                    return plan
+            raise _NotEnoughCapacity  # roll back the partial reservations
+    except _NotEnoughCapacity:
+        return None
+
+
+async def available_capacity(*, buyer_id: str, instrument: str, exclude: set[str] | frozenset = frozenset()) -> int:
+    query = select(func.coalesce(func.sum(Trade.tokens_total - Trade.tokens_used - Trade.tokens_reserved), 0)).where(
+        Trade.buyer_id == buyer_id,
+        Trade.instrument == instrument,
+        Trade.status == TRADE_ACTIVE,
+        Trade.expires_at > utcnow(),
+    )
+    if exclude:
+        query = query.where(Trade.id.not_in(sorted(exclude)))
+    async with SessionLocal() as session:
+        total = (await session.execute(query)).scalar_one()
+    return int(total)
+
+
+async def buy_capacity(
+    engine: MatchingEngine, redis: Redis, *, buyer_id: str, instrument: str, tokens: int, max_price_npt: int
+) -> list[Trade]:
+    """Market-buy `tokens` (IOC, protected by `max_price_npt`); unfilled
+    remainder is refunded automatically."""
+    _, trades = await place_order(
+        engine,
+        redis,
+        agent_id=buyer_id,
+        instrument=instrument,
+        side=BID,
+        order_type=MARKET,
+        time_in_force=IOC,
+        price_npt=max_price_npt,
+        quantity=tokens,
+        ttl_s=None,
+    )
+    return trades
 
 
 async def settle_job(
@@ -566,7 +620,9 @@ __all__ = [
     "place_order",
     "reconcile_book",
     "release_trade",
-    "reserve_allocation",
+    "available_capacity",
+    "buy_capacity",
+    "reserve_capacity",
     "settle_job",
     "run_sweeps",
 ]

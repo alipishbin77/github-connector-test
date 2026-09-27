@@ -17,4 +17,6 @@ COPY app ./app
 USER aether
 EXPOSE 8000
 # uvloop + httptools; one worker per container — scale with replicas, not forks.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--loop", "uvloop", "--http", "httptools", "--no-access-log", "--timeout-graceful-shutdown", "15"]
+# PORT is honoured for PaaS hosts (Render, Railway, Fly, Cloud Run).
+CMD exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}" --loop uvloop --http httptools \
+    --no-access-log --timeout-graceful-shutdown 15 --proxy-headers --forwarded-allow-ips '*'

@@ -134,7 +134,7 @@ async def test_concurrent_requests_cannot_overdraw_an_allocation(client, sellers
 
 async def test_orphaned_job_is_settled_from_checkpoint(app, client, sellers, instrument):
     from app.db import SessionLocal
-    from app.exchange import reserve_allocation
+    from app.exchange import reserve_capacity
     from app.models import InferenceJob
     from app.proxy_router import Checkpointer, recover_orphaned_jobs
 
@@ -154,11 +154,11 @@ async def test_orphaned_job_is_settled_from_checkpoint(app, client, sellers, ins
                 failovers=0,
             )
         )
-    seg = await reserve_allocation(buyer_id=buyer["agent_id"], instrument=instrument, tokens=50)
+    (seg,) = await reserve_capacity(buyer_id=buyer["agent_id"], instrument=instrument, tokens=50)
     ckpt = Checkpointer(app.state.redis, "job_orphan_" + instrument)
     await ckpt.save_segments([seg])
     for i in range(5):
-        await ckpt.add(i, f" t{i}", seg.trade_id)
+        await ckpt.add(i, f" t{i}", 0)
     await ckpt.flush()
     await app.state.redis.delete(ckpt.heartbeat_key)  # process gone: heartbeat lapses
 
