@@ -50,6 +50,32 @@ print(r.choices[0].message.content, r.usage, r.model_extra["aether"]["cost_usd"]
 
 The official `openai` Python SDK has been verified against the server, streaming and non-streaming.
 
+## Crypto payments (USDC on Base by default)
+
+Agents pay in a stablecoin to **one platform treasury address** (`AETHER_CRYPTO_TREASURY_ADDRESS`). The platform keeps
+its fee and pays sellers from the same wallet.
+
+1. **Link a wallet.** The agent calls `GET /v1/billing/crypto/link-challenge?address=0x…`, signs the returned message
+   with that wallet (EIP-191 `personal_sign`), and posts it to `POST /v1/billing/crypto/wallets`. This proves ownership,
+   so nobody can claim someone else's transfer.
+2. **Deposit.** The agent sends USDC on Base from the linked wallet to the treasury. A watcher polls the chain and credits
+   each transfer exactly once, after `AETHER_CRYPTO_CONFIRMATIONS` blocks. Transfers from wallets that aren't linked yet
+   are held as *unattributed* and credited automatically when that wallet is linked.
+3. **Trade.** Credited balance buys inference exactly like card-funded balance: escrow, per-token settlement, and the fee
+   into `house:fees` (your commission).
+4. **Withdraw (sellers, or buyers with unused credit).** `POST /v1/billing/crypto/withdrawals` pays only to the agent's
+   own linked wallet, and the ledger debits the agent immediately.
+5. **Pay out (you).** The server holds **no private key**. `GET /v1/admin/crypto/payouts` lists the queue. Send each
+   payout from your treasury wallet, then `POST /v1/admin/crypto/payouts/{id}/paid {"tx_hash": …}`. The server checks
+   on-chain that it was a successful USDC transfer from the treasury to that exact address for the exact amount, with
+   enough confirmations, before marking it paid. `…/cancel` refunds the agent.
+6. **Check solvency.** `GET /v1/admin/crypto/solvency` compares the treasury's on-chain balance with everything owed
+   (agent balances plus pending payouts) and shows fees earned.
+
+Everything under `/v1/admin/crypto/*` requires `X-Admin-Token`. Never put the treasury's private key or seed phrase on
+the server or in chat. If you later want payouts to be fully automatic, use a separate low-balance hot wallet topped up
+from the treasury.
+
 ## What is built and verified
 
 | Area | Status |
@@ -58,6 +84,8 @@ The official `openai` Python SDK has been verified against the server, streaming
 | OAuth2 JWTs, static API keys, secret rotation, scopes, per-agent rate limits | Done |
 | OpenAI-compatible `/v1/chat/completions` (+ streaming, usage), `/v1/models`, `/v1/quote` | Done; official SDK verified |
 | Auto-buy per request, multi-seller rollover, checkpoint resume, failover | Done |
+| Crypto deposits (USDC on Base: signed wallet linking, confirmed on-chain, idempotent) | Done (tested against a simulated chain) |
+| Crypto payouts (operator-sent, verified on-chain; cancel refunds; solvency check) | Done (tested against a simulated chain) |
 | Stripe deposits (Checkout + signed webhook, idempotent) | Done (tested against a mocked Stripe) |
 | Seller payouts (Stripe Connect Express onboarding, transfers, reversal on failure) | Done (tested against a mocked Stripe) |
 | Seller gateway for vLLM/SGLang/TGI with resume and proprietary-API refusal | Done (tested against a mocked upstream) |
