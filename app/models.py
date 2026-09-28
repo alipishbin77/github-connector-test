@@ -225,3 +225,54 @@ class Withdrawal(Base):
     stripe_transfer_id: Mapped[str | None] = mapped_column(String(64))
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class LinkedWallet(Base):
+    """An on-chain address an agent proved it controls (signed challenge).
+    Deposits from it are credited to the agent; payouts may only go to it."""
+
+    __tablename__ = "linked_wallets"
+
+    address: Mapped[str] = mapped_column(String(42), primary_key=True)  # lowercase 0x...
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CryptoDeposit(Base):
+    """One token Transfer into the treasury. Primary key '<chain>:<tx>:<log index>'
+    makes crediting idempotent across re-scans and replicas."""
+
+    __tablename__ = "crypto_deposits"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    tx_hash: Mapped[str] = mapped_column(String(66), index=True)
+    from_address: Mapped[str] = mapped_column(String(42), index=True)
+    amount_units: Mapped[int] = mapped_column(BigInteger)
+    block_number: Mapped[int] = mapped_column(BigInteger)
+    agent_id: Mapped[str | None] = mapped_column(ForeignKey("agents.id"), index=True)
+    status: Mapped[str] = mapped_column(String(16))  # credited | unattributed
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ChainCursor(Base):
+    __tablename__ = "chain_cursors"
+
+    chain_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    last_block: Mapped[int] = mapped_column(BigInteger)
+
+
+class CryptoPayout(Base):
+    """A withdrawal to an agent's linked wallet. Debited in the ledger at request
+    time; sent by the operator from the treasury; marked paid only after the
+    transfer is verified on-chain."""
+
+    __tablename__ = "crypto_payouts"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("cpo"))
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    to_address: Mapped[str] = mapped_column(String(42))
+    amount_units: Mapped[int] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(16), index=True)  # pending | paid | cancelled
+    tx_hash: Mapped[str | None] = mapped_column(String(66), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

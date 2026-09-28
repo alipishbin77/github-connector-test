@@ -25,6 +25,9 @@ HOUSE_FEES = "house:fees"
 HOUSE_MINT = "house:sandbox_mint"
 HOUSE_STRIPE_IN = "house:stripe_deposits"  # external money in (goes negative)
 HOUSE_STRIPE_OUT = "house:stripe_payouts"  # external money out
+HOUSE_CRYPTO_IN = "house:crypto_deposits"  # on-chain money in (goes negative)
+HOUSE_CRYPTO_PAYABLE = "house:crypto_payable"  # withdrawals approved in the ledger, not yet sent on-chain
+HOUSE_CRYPTO_OUT = "house:crypto_payouts"  # on-chain money out (verified)
 
 _BUCKET_ATTR = {AVAILABLE: "balance_available_nanos", ESCROW: "balance_escrow_nanos"}
 
