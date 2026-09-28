@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from redis.asyncio import ConnectionPool, Redis
 from sqlalchemy import text
 
-from . import api, auth, crypto_payments, openai_compat, payments, proxy_router
+from . import api, auth, crypto_payments, openai_compat, payments, proxy_router, site
 from .config import settings
 from .db import engine as db_engine
 from .db import init_models
@@ -113,6 +113,7 @@ app.include_router(proxy_router.router)
 app.include_router(openai_compat.router)
 app.include_router(payments.router)
 app.include_router(crypto_payments.router)
+app.include_router(site.router)
 
 
 @app.get("/healthz", tags=["ops"])
