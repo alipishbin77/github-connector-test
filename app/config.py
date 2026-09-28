@@ -57,6 +57,21 @@ class Settings(BaseSettings):
     max_deposit_usd: int = 10_000
     min_withdrawal_usd: int = 10
 
+    # Crypto rails (stablecoin on an EVM chain). Unset treasury => crypto endpoints return 503.
+    # Defaults: native USDC on Base mainnet.
+    crypto_treasury_address: str | None = None  # the platform wallet agents pay into (public address only)
+    crypto_rpc_url: str = "https://mainnet.base.org"
+    crypto_chain_id: int = 8453
+    crypto_chain_name: str = "Base"
+    crypto_token_address: str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    crypto_token_symbol: str = "USDC"
+    crypto_token_decimals: int = 6
+    crypto_confirmations: int = 10
+    crypto_poll_interval_s: float = 15.0
+    crypto_start_block: int | None = None  # first scan block; default: current safe head at first run
+    crypto_max_block_range: int = 500
+    crypto_min_withdrawal_usd: int = 10
+
     # Security / sandbox
     # Production-safe defaults; docker-compose and tests opt into the sandbox explicitly.
     sandbox_mode: bool = False  # open registration + faucet + audit endpoint

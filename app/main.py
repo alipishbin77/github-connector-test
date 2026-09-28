@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from redis.asyncio import ConnectionPool, Redis
 from sqlalchemy import text
 
-from . import api, auth, openai_compat, payments, proxy_router
+from . import api, auth, crypto_payments, openai_compat, payments, proxy_router
 from .config import settings
 from .db import engine as db_engine
 from .db import init_models
@@ -27,6 +27,7 @@ async def maintenance_loop(app: FastAPI) -> None:
         try:
             await run_sweeps(app.state.engine, app.state.redis)
             await proxy_router.recover_orphaned_jobs(app.state.redis)
+            await crypto_payments.run_watcher_pass(app)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -54,6 +55,8 @@ async def lifespan(app: FastAPI):
     )
 
     app.state.stripe = payments.StripeClient.create()
+    app.state.chain = crypto_payments.EvmClient.create()
+    app.state.deposit_watcher = crypto_payments.DepositWatcher(app.state.chain) if app.state.chain else None
 
     # Crash recovery: apply unapplied match events, then make the Redis book
     # agree with PostgreSQL before accepting orders.
@@ -66,10 +69,11 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(maintenance_loop(app), name="maintenance"),
     ]
     log.info(
-        "Aether clearinghouse ready (sandbox=%s, fee=%sbps, payments=%s)",
+        "Aether clearinghouse ready (sandbox=%s, fee=%sbps, stripe=%s, crypto=%s)",
         settings.sandbox_mode,
         settings.fee_bps,
-        "stripe" if app.state.stripe else "off",
+        "on" if app.state.stripe else "off",
+        f"{settings.crypto_token_symbol}@{settings.crypto_chain_name}" if app.state.chain else "off",
     )
     try:
         yield
@@ -83,6 +87,8 @@ async def lifespan(app: FastAPI):
         await app.state.http.aclose()
         if app.state.stripe is not None:
             await app.state.stripe.aclose()
+        if app.state.chain is not None:
+            await app.state.chain.aclose()
         await redis.aclose()
         await pool.disconnect()
         await db_engine.dispose()
@@ -106,6 +112,7 @@ app.include_router(api.router)
 app.include_router(proxy_router.router)
 app.include_router(openai_compat.router)
 app.include_router(payments.router)
+app.include_router(crypto_payments.router)
 
 
 @app.get("/healthz", tags=["ops"])
