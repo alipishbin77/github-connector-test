@@ -11,3 +11,4 @@ PyJWT[crypto]==2.15.0
 cryptography==50.0.1
 python-multipart==0.0.32
 eth-account==0.14.0
+jsonschema==4.26.0
