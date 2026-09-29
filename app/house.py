@@ -1,4 +1,4 @@
-"""House services: five tasks the platform itself sells, so the catalogue is
+"""House services: six tasks the platform itself sells, so the catalogue is
 never empty. No GPU, no LLM, no paid API.
 
   POST /v1/house/webpage-to-markdown  {"url": "https://..."}
@@ -12,6 +12,9 @@ never empty. No GPU, no LLM, no paid API.
   POST /v1/house/portfolio            {"address": "0x...", "networks": ["base", "arbitrum"]}
        -> native balance plus a capped, allow-listed set of token balances,
           per requested EVM network (every configured network if omitted)
+  POST /v1/house/sitemap-to-markdown  {"sitemap_url": "https://..."} or {"url": "https://..."}
+       -> up to `SITEMAP_MAX_PAGES` pages of one site as Markdown, read from a
+          sitemap or discovered by crawling same-origin links from a root URL
 
 These are ordinary *seller* endpoints: the clearinghouse calls them exactly as
 it calls a third party's, with the compact JSON body
@@ -64,12 +67,35 @@ same way `domain-trust-audit` bounds its checks, and identical
 `(address, networks)` calls are served from a 30-second in-process cache
 (`PORTFOLIO_CACHE_TTL_S`) so a buyer polling for a pending deposit does not
 multiply against the RPCs at all.
+
+`sitemap-to-markdown` is the widest fetch surface of any house service: it
+follows a sitemap, or links discovered on pages it has already fetched, to
+build a whole corpus in one call. A link found on a public page is not more
+trusted than the seed URL a buyer typed in — it is a fresh SSRF surface with
+the same blast radius — so every fetch it makes, without exception, goes
+through `_fetch_page` via `_fetch_checked`: robots.txt, the sitemap (and any
+child sitemaps a sitemap index names), and every discovered page. Nothing in
+this endpoint opens a connection any other way. On top of that shared check,
+a crawl obeys `robots.txt` (fetched the same checked way, parsed with the
+standard library's `urllib.robotparser`), follows same-origin links only, is
+paced at one request per host per second (`_rate_limit`, keyed by host so
+unrelated crawls never wait on each other), never returns more than
+`SITEMAP_MAX_PAGES` pages, never runs past `SITEMAP_BUDGET_S` or
+`SITEMAP_MAX_TOTAL_BYTES`, and only ever runs one at a time process-wide — a
+second call while one is in flight gets a 429, not a queued or parallel
+crawl. A page that fails to fetch is reported as that page's own `status`,
+the same partial-failure rule `domain-trust-audit` and `portfolio` already
+follow, except for the seed URL itself (the named sitemap, or the root page
+to crawl from), which — like `webpage-to-markdown`'s single URL — fails the
+whole call if it cannot be fetched at all: a $0.35 call that returns zero
+pages should not be charged for as a success.
 """
 
 import asyncio
 import contextlib
 import hashlib
 import hmac
+import html
 import ipaddress
 import json
 import logging
@@ -80,6 +106,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, NamedTuple, TypeVar
 from urllib.parse import urljoin, urlparse
+from urllib.robotparser import RobotFileParser
 
 import dns.asyncresolver
 import dns.exception
@@ -111,6 +138,7 @@ FETCH_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 USER_AGENT = "Aether-house-services/1.0 (agent marketplace; webpage-to-markdown)"
 READABLE_TYPES = ("text/html", "application/xhtml+xml", "text/plain", "text/markdown", "text/xml", "application/xml")
 MAX_SCHEMA_ERRORS = 50
+SITEMAP_MAX_PAGES = 50  # sitemap-to-markdown: hard ceiling, whatever the buyer requests; referenced by SitemapIn below
 
 # ---- domain-trust-audit. Every number here is a ceiling, not a target: the box
 # has 3 GB and no swap, so one buyer must not be able to hold a worker open.
@@ -177,6 +205,13 @@ class PortfolioIn(BaseModel):
 class DomainIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
     domain: str = Field(min_length=1, max_length=2048)  # a whole URL is accepted; its host is taken
+
+
+class SitemapIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    sitemap_url: str | None = Field(None, min_length=8, max_length=2048)
+    url: str | None = Field(None, min_length=8, max_length=2048)
+    max_pages: int | None = Field(None, ge=1, le=SITEMAP_MAX_PAGES)
 
 
 def _error(status: int, code: str, description: str) -> HTTPException:
@@ -1171,3 +1206,331 @@ async def portfolio(request: Request):
         _portfolio_cache.clear()
     _portfolio_cache[cache_key] = (time.monotonic() + PORTFOLIO_CACHE_TTL_S, output)
     return {"output": output}
+
+
+# ----------------------------------------------------- sitemap-to-markdown: limits
+
+# This is the widest fetch surface of any house service: it follows a sitemap, or
+# links found on pages it has already fetched, to whatever else the site points
+# at. Every number here is a hard ceiling for the same reason the audit's are —
+# the box has 3 GB and no swap — plus one more: a buyer must not be able to turn
+# this endpoint into an open, unthrottled crawler against a third party's site.
+SITEMAP_BUDGET_S = 60.0  # whole call: robots.txt, the sitemap (and its children), and every page
+SITEMAP_MAX_TOTAL_BYTES = 20_000_000  # accumulated across every page fetched, on top of MAX_PAGE_BYTES per page
+SITEMAP_RATE_LIMIT_S = 1.0  # at most one request per second to any one host
+SITEMAP_RATE_HOSTS_MAX = 4_000  # same clear-when-full pattern as auth._api_key_cache / _portfolio_cache
+SITEMAP_MIN_FREE_MB = 300.0  # refuse to start a crawl below this much available memory
+SITEMAP_MAX_INDEX_CHILDREN = 5  # a sitemap index may list many child sitemaps; only the first few are followed
+SITEMAP_MAX_DISCOVERED_LINKS = SITEMAP_MAX_PAGES * 20  # bounds the crawl queue against a single link-heavy page
+
+# A sitemap's <loc> entries, whether it is a <urlset> (pages) or a <sitemapindex>
+# (child sitemaps) — both use the same tag, so one pattern reads either.
+_LOC_RE = re.compile(r"<loc>\s*([^<\s][^<]*?)\s*</loc>", re.IGNORECASE)
+# Same spirit as readable.py's own small hand-rolled parser: no dependency, and
+# this only needs href targets, not a full document model.
+_HREF_RE = re.compile(r"""<a\b[^>]*?\bhref\s*=\s*["']([^"'#][^"']*)["']""", re.IGNORECASE)
+
+_sitemap_crawl_lock = asyncio.Lock()  # one crawl at a time, process-wide
+_sitemap_rate_lock = asyncio.Lock()
+_sitemap_host_next: dict[str, float] = {}  # host -> monotonic time it may next be requested
+
+
+def _available_memory_mb() -> float:
+    """`MemAvailable` from /proc/meminfo, in MB. Read directly rather than
+    shelling out to `free`: it is the same number, one syscall-backed file read,
+    no subprocess."""
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1024
+    raise RuntimeError("MemAvailable not reported by /proc/meminfo")
+
+
+async def _sitemap_rate_limit(host: str) -> None:
+    """At most one request per second to any one host, kept across calls (not
+    reset per crawl) so two crawls of the same site back to back still can't
+    exceed a polite pace. Keyed by host, not global, so a crawl of one site
+    never waits on unrelated traffic to another — the lock below only guards
+    the shared schedule, never the sleep itself."""
+    async with _sitemap_rate_lock:
+        if len(_sitemap_host_next) > SITEMAP_RATE_HOSTS_MAX:
+            _sitemap_host_next.clear()
+        now = time.monotonic()
+        ready_at = max(now, _sitemap_host_next.get(host, 0.0))
+        _sitemap_host_next[host] = ready_at + SITEMAP_RATE_LIMIT_S
+        wait = ready_at - now
+    if wait > 0:
+        await asyncio.sleep(wait)
+
+
+async def _fetch_checked(http: httpx.AsyncClient, url: str, deadline: float) -> tuple[str, str, str]:
+    """Every URL sitemap-to-markdown fetches — robots.txt, the sitemap, and
+    every page, whether listed in the sitemap or found by following a link —
+    comes through here and nowhere else. It is not a second, lighter fetch
+    path: it checks the call's time budget, paces the request per host, and
+    then hands off to `_fetch_page`, the exact per-hop netguard-checked
+    fetcher `webpage-to-markdown` already uses. A link discovered on a page
+    this crawl already fetched is not more trusted than the seed URL — it is
+    a fresh SSRF surface — so it gets the identical check, every time."""
+    if time.monotonic() >= deadline:
+        raise _error(504, "budget_exhausted", "the call's time budget was spent before this URL could be fetched")
+    await _sitemap_rate_limit(urlparse(url).hostname or "")
+    return await _fetch_page(http, url)
+
+
+def _origin(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _same_origin(url: str, origin: str) -> bool:
+    return _origin(url) == origin
+
+
+def _sitemap_locs(xml_text: str) -> list[str]:
+    return [html.unescape(match.group(1)) for match in _LOC_RE.finditer(xml_text)]
+
+
+def _is_sitemap_index(xml_text: str) -> bool:
+    # The root element appears near the top; scanning the whole (already
+    # size-capped) document would work too, but there is no reason to.
+    return bool(re.search(r"<sitemapindex[\s>]", xml_text[:4096], re.IGNORECASE))
+
+
+def _extract_same_origin_links(html_text: str, base_url: str, origin: str) -> list[str]:
+    """Same-origin `href` targets on a page already fetched through the
+    checked path. Off-origin links are dropped outright — "simplest is to
+    only crawl same-origin links from the seed" — rather than rate-limited
+    separately as a second site."""
+    found: list[str] = []
+    for match in _HREF_RE.finditer(html_text):
+        href = html.unescape(match.group(1).strip())
+        if href.lower().startswith(("javascript:", "mailto:", "tel:", "data:")):
+            continue
+        absolute = urljoin(base_url, href).split("#", 1)[0]
+        parsed = urlparse(absolute)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if f"{parsed.scheme}://{parsed.netloc}" != origin:
+            continue
+        found.append(absolute)
+    return found
+
+
+def _robots_allowed(rp: RobotFileParser, url: str) -> bool:
+    try:
+        return rp.can_fetch("*", url)
+    except Exception:  # a hostile or malformed robots.txt must not block the crawl
+        return True
+
+
+async def _fetch_robots(http: httpx.AsyncClient, origin: str, deadline: float) -> RobotFileParser:
+    """robots.txt for `origin`, fetched through `_fetch_checked` like every
+    other URL here. A robots.txt that cannot be read at all — missing, times
+    out, wrong content type — is not a safety failure: it means no crawl
+    restrictions apply, the same as any browser finds with no robots.txt to
+    obey. A refused origin is a different thing entirely: that means the site
+    itself is unsafe to connect to, so it is not swallowed here and is left to
+    fail the whole call the same way an unsafe seed URL would."""
+    rp = RobotFileParser()
+    try:
+        _, _, text = await _fetch_checked(http, f"{origin}/robots.txt", deadline)
+    except HTTPException as exc:
+        if exc.detail.get("error") == "refused_url":
+            raise
+        # Missing/unreadable robots.txt means no crawl restrictions apply. A
+        # RobotFileParser that has never seen read()/parse() defaults to
+        # *deny* everything (can_fetch guards against being queried before
+        # read() completes) — set allow_all explicitly rather than relying
+        # on stdlib default behavior.
+        rp.allow_all = True
+        return rp
+    rp.parse(text.splitlines())
+    return rp
+
+
+async def _sitemap_urls(
+    http: httpx.AsyncClient, sitemap_url: str, origin: str, rp: RobotFileParser, max_pages: int, deadline: float
+) -> tuple[list[str], bool]:
+    """Page URLs named by a sitemap, following at most
+    `SITEMAP_MAX_INDEX_CHILDREN` child sitemaps if `sitemap_url` is a sitemap
+    index rather than a plain one. Same-origin and robots-allowed only,
+    capped at `max_pages`. Only `sitemap_url` itself is treated as the seed —
+    if it fails to fetch, that failure is raised, not swallowed; a broken
+    child sitemap just yields fewer pages."""
+    to_visit = [sitemap_url]
+    pages: list[str] = []
+    sitemap_fetches = 0
+    truncated = False
+    while to_visit:
+        if time.monotonic() >= deadline or sitemap_fetches >= SITEMAP_MAX_INDEX_CHILDREN + 1 or len(pages) >= max_pages:
+            truncated = True
+            break
+        current = to_visit.pop(0)
+        try:
+            _, _, text = await _fetch_checked(http, current, deadline)
+        except HTTPException:
+            if current == sitemap_url:
+                raise
+            continue
+        sitemap_fetches += 1
+        if _is_sitemap_index(text):
+            to_visit.extend(loc for loc in _sitemap_locs(text) if _same_origin(loc, origin))
+            continue
+        for loc in _sitemap_locs(text):
+            if len(pages) >= max_pages:
+                truncated = True
+                break
+            if _same_origin(loc, origin) and _robots_allowed(rp, loc):
+                pages.append(loc)
+    if to_visit:
+        truncated = True
+    return pages, truncated
+
+
+async def _crawl_sitemap(
+    http: httpx.AsyncClient, sitemap_url: str, origin: str, rp: RobotFileParser, max_pages: int, deadline: float
+) -> tuple[list[dict], bool]:
+    """Fetch and convert every page a sitemap names. Each page fetch here is a
+    *discovered* URL, not the seed (the seed was `sitemap_url` itself, already
+    validated by `_sitemap_urls`), so a page that fails to fetch is reported
+    as that page's own result rather than failing the whole call."""
+    urls, truncated = await _sitemap_urls(http, sitemap_url, origin, rp, max_pages, deadline)
+    results: list[dict] = []
+    total_bytes = 0
+    for url in urls:
+        if time.monotonic() >= deadline or total_bytes >= SITEMAP_MAX_TOTAL_BYTES:
+            truncated = True
+            break
+        try:
+            final_url, content_type, text = await _fetch_checked(http, url, deadline)
+        except HTTPException as exc:
+            results.append(
+                {
+                    "url": url,
+                    "status": "error",
+                    "error": exc.detail.get("error", "fetch_failed"),
+                    "message": exc.detail.get("error_description", ""),
+                }
+            )
+            continue
+        total_bytes += len(text.encode("utf-8", errors="ignore"))
+        if content_type.lower().startswith(("text/plain", "text/markdown")):
+            markdown = text.strip()
+        else:
+            markdown = html_to_markdown(text, base_url=final_url)
+        results.append({"url": final_url, "status": "ok", "markdown": markdown})
+    return results, truncated
+
+
+async def _crawl_from_root(
+    http: httpx.AsyncClient, root_url: str, origin: str, rp: RobotFileParser, max_pages: int, deadline: float
+) -> tuple[list[dict], bool]:
+    """Breadth-first same-origin crawl starting at `root_url`, discovering more
+    pages from the links on each one it fetches. `root_url` is the seed here —
+    like `sitemap_url` above, a failure to fetch it fails the whole call —
+    every page reached afterward by following a link is reported per-page."""
+    queue = [root_url]
+    seen = {root_url}
+    results: list[dict] = []
+    total_bytes = 0
+    truncated = False
+    first = True
+    while queue:
+        if len(results) >= max_pages or time.monotonic() >= deadline or total_bytes >= SITEMAP_MAX_TOTAL_BYTES:
+            truncated = True
+            break
+        url = queue.pop(0)
+        if not _robots_allowed(rp, url):
+            first = False
+            continue
+        try:
+            final_url, content_type, text = await _fetch_checked(http, url, deadline)
+        except HTTPException as exc:
+            if first:
+                raise
+            results.append(
+                {
+                    "url": url,
+                    "status": "error",
+                    "error": exc.detail.get("error", "fetch_failed"),
+                    "message": exc.detail.get("error_description", ""),
+                }
+            )
+            first = False
+            continue
+        first = False
+        total_bytes += len(text.encode("utf-8", errors="ignore"))
+        if content_type.lower().startswith(("text/plain", "text/markdown")):
+            markdown = text.strip()
+        else:
+            markdown = html_to_markdown(text, base_url=final_url)
+            for link in _extract_same_origin_links(text, final_url, origin):
+                if link not in seen and len(seen) < SITEMAP_MAX_DISCOVERED_LINKS:
+                    seen.add(link)
+                    queue.append(link)
+        results.append({"url": final_url, "status": "ok", "markdown": markdown})
+    if queue:
+        truncated = True
+    return results, truncated
+
+
+# ---------------------------------------------------- sitemap-to-markdown: the endpoint
+
+
+@router.post("/sitemap-to-markdown")
+async def sitemap_to_markdown(request: Request):
+    """Up to `SITEMAP_MAX_PAGES` pages of one site as Markdown, from a named
+    sitemap (`sitemap_url`) or crawled from a root URL (`url`) — exactly one
+    of the two must be given.
+
+    One crawl runs at a time across the whole process: a second call that
+    arrives while one is in flight gets a 429 rather than queuing silently or
+    running alongside it and doubling the load on whichever site is being
+    read. Every fetch this makes goes through `_fetch_checked`, which wraps
+    the same per-hop netguard-checked `_fetch_page` every other house
+    endpoint's page fetch uses — see `_fetch_checked` for why that applies
+    equally to a link this crawl only just discovered."""
+    body = _parse(SitemapIn, await authorized_input(request, "sitemap-to-markdown"))
+    if bool(body.sitemap_url) == bool(body.url):
+        raise _error(422, "invalid_input", "exactly one of sitemap_url or url must be given")
+
+    if _sitemap_crawl_lock.locked():
+        raise _error(429, "crawler_busy", "another sitemap crawl is already running on this server; try again shortly")
+
+    available_mb = _available_memory_mb()
+    if available_mb < SITEMAP_MIN_FREE_MB:
+        raise _error(503, "insufficient_memory", f"only {available_mb:.0f}MB available; refusing to start a crawl")
+
+    async with _sitemap_crawl_lock:
+        seed = body.sitemap_url or body.url
+        origin = _origin(seed)
+        max_pages = min(body.max_pages or SITEMAP_MAX_PAGES, SITEMAP_MAX_PAGES)
+        deadline = time.monotonic() + SITEMAP_BUDGET_S
+
+        rp = await _fetch_robots(request.app.state.http, origin, deadline)
+
+        if body.sitemap_url:
+            source = "sitemap"
+            pages, truncated = await _crawl_sitemap(request.app.state.http, seed, origin, rp, max_pages, deadline)
+        else:
+            source = "crawl"
+            if not _robots_allowed(rp, seed):
+                pages, truncated = [], False
+            else:
+                pages, truncated = await _crawl_from_root(request.app.state.http, seed, origin, rp, max_pages, deadline)
+
+    fetched = sum(1 for page in pages if page["status"] == "ok")
+    return {
+        "output": {
+            "source": source,
+            "seed_url": seed,
+            "origin": origin,
+            "page_cap": SITEMAP_MAX_PAGES,
+            "pages": pages,
+            "pages_fetched": fetched,
+            "pages_attempted": len(pages),
+            "truncated": truncated,
+            "checked_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }
+    }
