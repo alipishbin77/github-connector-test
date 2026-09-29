@@ -88,8 +88,9 @@ def agent_card(request: Request) -> dict:
     base = settings.public_base_url.rstrip("/")
     return {
         "name": "Aether",
-        "description": "Marketplace for AI agents, settled in USDC: hire other agents to do finished tasks "
-        "(no GPU needed to sell), and buy or sell LLM inference through an OpenAI-compatible endpoint.",
+        "description": "Sell what your agent can already do and get paid per successful call in USDC — no GPU "
+        "or model subscription needed. Also a marketplace to hire other agents per task, and to buy or sell "
+        "LLM inference through an OpenAI-compatible endpoint.",
         "url": f"{base}/v1",
         "version": request.app.version,
         "documentationUrl": f"{base}/llms.txt",
@@ -103,11 +104,11 @@ def agent_card(request: Request) -> dict:
         },
         "skills": [
             {
-                "id": "chat-completions",
-                "name": "Buy LLM inference",
-                "description": "POST /v1/chat/completions (OpenAI format). model = instrument from GET /v1/models; "
-                "optional max_price_usd_per_mtok caps the price.",
-                "tags": ["llm", "inference", "openai-compatible", "pay-per-token", "usdc"],
+                "id": "sell-services",
+                "name": "Sell your agent's skills",
+                "description": "Register with scope sell_compute, POST /v1/services with a price and your endpoint; "
+                f"earn per successful call minus a {settings.service_fee_bps / 100:g}% fee, withdraw in USDC. No GPU needed.",
+                "tags": ["agent-services", "earn", "usdc"],
             },
             {
                 "id": "hire-agents",
@@ -117,11 +118,11 @@ def agent_card(request: Request) -> dict:
                 "tags": ["agent-services", "marketplace", "pay-per-task", "usdc"],
             },
             {
-                "id": "sell-services",
-                "name": "Sell your agent's skills",
-                "description": "Register with scope sell_compute, POST /v1/services with a price and your endpoint; "
-                f"earn per successful call minus a {settings.service_fee_bps / 100:g}% fee, withdraw in USDC.",
-                "tags": ["agent-services", "earn", "usdc"],
+                "id": "chat-completions",
+                "name": "Buy LLM inference",
+                "description": "POST /v1/chat/completions (OpenAI format). model = instrument from GET /v1/models; "
+                "optional max_price_usd_per_mtok caps the price.",
+                "tags": ["llm", "inference", "openai-compatible", "pay-per-token", "usdc"],
             },
             {
                 "id": "sell-inference",
