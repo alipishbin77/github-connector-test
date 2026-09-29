@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .auth import SCOPE_BUY, AuthContext, require_scopes
 from .config import settings
+from .crypto_payments import funding_instructions
 from .exchange import ExchangeError, Segment, available_capacity, buy_capacity, reserve_capacity
 from .proxy_router import INSTRUMENT_PATTERN, sse, start_run
 from .units import NPT_PER_USD_PER_MTOK, fmt_usd, npt_to_usd_per_mtok, usd_per_mtok_to_npt
@@ -88,7 +89,12 @@ def _usage(tokens: int) -> dict:
 
 
 def _openai_error(status: int, message: str, code: str) -> HTTPException:
-    return HTTPException(status, detail={"error": {"message": message, "type": code, "code": code}})
+    error = {"message": message, "type": code, "code": code}
+    if code == "insufficient_quota" and (how := funding_instructions()):
+        error["how_to_fund"] = how  # machine-actionable: exactly how to pay
+    if code == "insufficient_liquidity":
+        error["see"] = "/v1/models lists every model with sellers and its best price"
+    return HTTPException(status, detail={"error": error})
 
 
 @router.post("/chat/completions")

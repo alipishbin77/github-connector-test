@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from redis.asyncio import ConnectionPool, Redis
 from sqlalchemy import text
 
-from . import api, auth, crypto_payments, openai_compat, payments, proxy_router, site
+from . import api, auth, crypto_payments, feedback, openai_compat, payments, proxy_router, site
 from .config import settings
 from .db import engine as db_engine
 from .db import init_models
@@ -55,8 +55,7 @@ async def lifespan(app: FastAPI):
     )
 
     app.state.stripe = payments.StripeClient.create()
-    app.state.chain = crypto_payments.EvmClient.create()
-    app.state.deposit_watcher = crypto_payments.DepositWatcher(app.state.chain) if app.state.chain else None
+    app.state.crypto = crypto_payments.CryptoRails.create()
 
     # Crash recovery: apply unapplied match events, then make the Redis book
     # agree with PostgreSQL before accepting orders.
@@ -73,7 +72,9 @@ async def lifespan(app: FastAPI):
         settings.sandbox_mode,
         settings.fee_bps,
         "on" if app.state.stripe else "off",
-        f"{settings.crypto_token_symbol}@{settings.crypto_chain_name}" if app.state.chain else "off",
+        ",".join(f"{r.network.token_symbol}@{r.network.key}" for r in app.state.crypto.rails.values())
+        if app.state.crypto
+        else "off",
     )
     try:
         yield
@@ -87,8 +88,8 @@ async def lifespan(app: FastAPI):
         await app.state.http.aclose()
         if app.state.stripe is not None:
             await app.state.stripe.aclose()
-        if app.state.chain is not None:
-            await app.state.chain.aclose()
+        if app.state.crypto is not None:
+            await app.state.crypto.aclose()
         await redis.aclose()
         await pool.disconnect()
         await db_engine.dispose()
@@ -113,6 +114,7 @@ app.include_router(proxy_router.router)
 app.include_router(openai_compat.router)
 app.include_router(payments.router)
 app.include_router(crypto_payments.router)
+app.include_router(feedback.router)
 app.include_router(site.router)
 
 

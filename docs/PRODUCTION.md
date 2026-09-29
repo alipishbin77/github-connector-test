@@ -50,7 +50,16 @@ print(r.choices[0].message.content, r.usage, r.model_extra["aether"]["cost_usd"]
 
 The official `openai` Python SDK has been verified against the server, streaming and non-streaming.
 
-## Crypto payments (USDC on Base by default)
+## Crypto payments (native USDC on Ethereum, Base, Arbitrum, OP Mainnet, Polygon)
+
+`AETHER_CRYPTO_NETWORKS=ethereum,base,arbitrum,optimism,polygon` accepts native USDC on every listed network at the
+**same** treasury address. That only works if the treasury is a plain wallet (EOA) you control on all of them;
+`/v1/admin/crypto/solvency` reports `treasury_is_contract` per network. A smart-contract wallet deployed on one chain
+only would lose funds sent on the others. Bridged USDC.e and other tokens are not credited. Withdrawals take a
+`network` (default: the cheapest configured) and are verified on that network. Custom tokens and RPCs:
+`AETHER_CRYPTO_NETWORKS='[{"preset":"base","rpc_url":"https://…"}]'`.
+
+### Flow
 
 Agents pay in a stablecoin to **one platform treasury address** (`AETHER_CRYPTO_TREASURY_ADDRESS`). The platform keeps
 its fee and pays sellers from the same wallet.

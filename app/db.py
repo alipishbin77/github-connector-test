@@ -1,7 +1,7 @@
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 
-from sqlalchemy import event
+from sqlalchemy import event, inspect
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -52,6 +52,20 @@ async def init_models() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_add_missing_columns)
+
+
+# Forward-only column additions for tables that already exist in a deployed
+# database (create_all never alters existing tables). Replace with Alembic
+# migrations once the schema changes more often.
+_COLUMN_ADDITIONS = [("crypto_payouts", "chain_id", "INTEGER")]
+
+
+def _add_missing_columns(sync_conn) -> None:
+    insp = inspect(sync_conn)
+    for table, column, ddl in _COLUMN_ADDITIONS:
+        if insp.has_table(table) and column not in {c["name"] for c in insp.get_columns(table)}:
+            sync_conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def utcnow() -> datetime:
