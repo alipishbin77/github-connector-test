@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     service_fee_bps: int = 1000  # 10% of each successful call
     service_max_timeout_s: int = 120
     service_max_output_bytes: int = 1_000_000
+    # The only agent allowed to list services against /v1/house/*. Unset means nobody is:
+    # otherwise a stranger could list the platform's own house endpoint as their own service
+    # and be paid for work this server performs at its own cost. See app/house.py.
+    house_agent_id: str | None = None
 
     # Proxy router
     seller_connect_timeout_s: float = 3.0

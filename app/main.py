@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from redis.asyncio import ConnectionPool, Redis
 from sqlalchemy import text
 
-from . import api, auth, crypto_payments, feedback, openai_compat, payments, proxy_router, services, site
+from . import api, auth, crypto_payments, feedback, house, openai_compat, payments, proxy_router, services, site
 from .config import settings
 from .db import engine as db_engine
 from .db import init_models
@@ -116,6 +116,7 @@ app.include_router(openai_compat.router)
 app.include_router(payments.router)
 app.include_router(crypto_payments.router)
 app.include_router(services.router)
+app.include_router(house.router)
 app.include_router(feedback.router)
 app.include_router(site.router)
 
