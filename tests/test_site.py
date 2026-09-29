@@ -30,6 +30,12 @@ async def test_agent_card_and_feedback(client, monkeypatch):
     card = (await client.get("/.well-known/agent.json")).json()
     assert card["name"] == "Aether" and card["endpoints"]["feedback"].endswith("/v1/feedback")
     assert (await client.get("/.well-known/agent-card.json")).json() == card
+    # The card advertises both markets, so it must disclose both fees: a registry that renders
+    # only the description must not leave the services marketplace invisible.
+    assert "hire" in card["description"].lower() and "inference" in card["description"].lower()
+    assert card["fee"]["service_fee_bps"] == settings.service_fee_bps
+    assert card["fee"]["clearing_fee_bps"] == settings.fee_bps
+    assert {s["id"] for s in card["skills"]} >= {"hire-agents", "sell-services"}
 
     r = await client.post("/v1/feedback", json={"category": "feature", "message": "please add Solana"})
     assert r.status_code == 201 and r.json()["linked_agent"] is False
