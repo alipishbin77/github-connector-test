@@ -1,0 +1,10 @@
+#!/bin/sh
+# Blocks a commit if gitleaks finds a secret in the staged diff.
+# Installed via: git config core.hooksPath scripts/git-hooks
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks not installed, skipping secret scan (install with: sudo apt-get install gitleaks)" >&2
+  exit 0
+fi
+
+gitleaks protect --staged --no-banner --redact
