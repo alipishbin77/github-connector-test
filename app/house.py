@@ -1,4 +1,4 @@
-"""House services: four tasks the platform itself sells, so the catalogue is
+"""House services: five tasks the platform itself sells, so the catalogue is
 never empty. No GPU, no LLM, no paid API.
 
   POST /v1/house/webpage-to-markdown  {"url": "https://..."}
@@ -9,6 +9,9 @@ never empty. No GPU, no LLM, no paid API.
        -> that address's native-USDC balance on one EVM network
   POST /v1/house/domain-trust-audit   {"domain": "example.com"}
        -> mail-authentication, TLS and security-header posture for one domain
+  POST /v1/house/portfolio            {"address": "0x...", "networks": ["base", "arbitrum"]}
+       -> native balance plus a capped, allow-listed set of token balances,
+          per requested EVM network (every configured network if omitted)
 
 These are ordinary *seller* endpoints: the clearinghouse calls them exactly as
 it calls a third party's, with the compact JSON body
@@ -43,6 +46,24 @@ client (no new pool), pre-checked hop by hop like the page fetcher.
 
 Every check degrades to a reported failure. No MX, no TLS listener and
 NXDOMAIN are all *results*; only a malformed domain is a 4xx.
+
+`portfolio` reads more addresses on the same pre-configured RPC endpoints
+`usdc-balance` already trusts: one JSON-RPC host per network, taken from
+`PRESETS`, never a hostname the buyer supplies. That is the same trust
+boundary `usdc-balance` uses, not a new one, so no `netguard` check applies
+here, exactly as none applies to the RPC call `usdc-balance` already makes.
+A wallet can hold hundreds of tokens, and discovering which ones would mean
+either a paid indexer or scraping a block explorer — both out of bounds for
+a house service — so each network instead carries a small, fixed,
+hand-picked allowlist (`TOKEN_ALLOWLIST`) that is only ever extended by a
+reviewed code change, never by a buyer's request. Every RPC call, across
+every requested network, shares one semaphore (`PORTFOLIO_RPC_CONCURRENCY`)
+so a wide `networks` list cannot flood any single public endpoint, each
+network gets its own slice of a whole-call budget (`PORTFOLIO_BUDGET_S`) the
+same way `domain-trust-audit` bounds its checks, and identical
+`(address, networks)` calls are served from a 30-second in-process cache
+(`PORTFOLIO_CACHE_TTL_S`) so a buyer polling for a pending deposit does not
+multiply against the RPCs at all.
 """
 
 import asyncio
@@ -142,6 +163,15 @@ class BalanceIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
     address: str = Field(min_length=42, max_length=42)
     network: str | None = None
+
+
+class PortfolioIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    address: str = Field(min_length=42, max_length=42)
+    # None means every configured network. The cap is generous relative to the
+    # five configured presets; it only exists so a buyer cannot make the
+    # dedup-and-validate loop below do unbounded work.
+    networks: list[str] | None = Field(None, max_length=20)
 
 
 class DomainIn(BaseModel):
@@ -952,3 +982,192 @@ async def domain_trust_audit(request: Request):
             "dns_queries_used": MAX_DNS_QUERIES - budget.left,
         }
     }
+
+
+# ---------------------------------------------------- portfolio: token allowlist
+
+# Native (Circle-issued) USDC addresses are reused straight from PRESETS: they
+# are already the ones the deposit rails trust. WETH is added per network as
+# the one other asset that is both extremely high-liquidity and has a single,
+# unambiguous, well-published contract address on every network here — on
+# Base and OP Mainnet it is the same OP-stack predeploy, 0x...0006. Every
+# address below was cross-checked against that network's own documentation
+# before being hard-coded; this table is the entire "token discovery" this
+# service does. Growing it is a deliberate code change, not a buyer's choice.
+TOKEN_ALLOWLIST: dict[str, tuple[tuple[str, str, int], ...]] = {
+    # network key -> ((symbol, contract address, decimals), ...)
+    "ethereum": (
+        ("USDC", PRESETS["ethereum"].token_address, 6),
+        ("WETH", "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", 18),
+    ),
+    "base": (
+        ("USDC", PRESETS["base"].token_address, 6),
+        ("WETH", "0x4200000000000000000000000000000000000006", 18),
+    ),
+    "arbitrum": (
+        ("USDC", PRESETS["arbitrum"].token_address, 6),
+        ("WETH", "0x82af49447d8a07e3bd95bd0d56f35241523fbab1", 18),
+    ),
+    "optimism": (
+        ("USDC", PRESETS["optimism"].token_address, 6),
+        ("WETH", "0x4200000000000000000000000000000000000006", 18),
+    ),
+    "polygon": (
+        ("USDC", PRESETS["polygon"].token_address, 6),
+        ("WETH", "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619", 18),
+    ),
+}
+MAX_TOKENS_PER_CHAIN = 8  # a hard ceiling on the table above, checked at import time
+assert all(len(tokens) <= MAX_TOKENS_PER_CHAIN for tokens in TOKEN_ALLOWLIST.values()), (
+    "TOKEN_ALLOWLIST exceeds MAX_TOKENS_PER_CHAIN"
+)
+
+# The native gas asset is not a token contract, so it is not in the allowlist
+# above; every network here uses 18 decimals for it. Polygon's is POL
+# (formerly MATIC, migrated 2024); the rest are ETH.
+NATIVE_SYMBOL = {"ethereum": "ETH", "base": "ETH", "arbitrum": "ETH", "optimism": "ETH", "polygon": "POL"}
+NATIVE_DECIMALS = 18
+
+PORTFOLIO_RPC_CONCURRENCY = 6  # in-flight JSON-RPC calls across the whole request, whatever chains are asked for
+PORTFOLIO_CHAIN_BUDGET_S = 8.0  # one network's native + token reads, combined
+PORTFOLIO_BUDGET_S = 15.0  # the whole call, across every requested network
+PORTFOLIO_CACHE_TTL_S = 30.0
+PORTFOLIO_CACHE_MAX = 4_000  # same clear-when-full pattern as auth._api_key_cache
+
+# (address, networks) -> (expiry_monotonic, output). An in-process cache is
+# enough here: it only needs to survive 30 seconds, and losing it on a
+# restart or in another worker just means the next call re-reads the chain.
+_portfolio_cache: dict[tuple[str, tuple[str, ...]], tuple[float, dict]] = {}
+
+
+def _portfolio_networks(raw: list[str] | None) -> list[Network]:
+    """The requested networks as `Network`s, defaulting to every configured
+    preset. Unknown keys are rejected the same way `usdc-balance` rejects
+    one; duplicates are dropped so the cache key is deterministic."""
+    if raw is None:
+        return list(PRESETS.values())
+    keys: list[str] = []
+    seen: set[str] = set()
+    for key in raw:
+        norm = key.strip().lower()
+        if norm and norm not in seen:
+            seen.add(norm)
+            keys.append(norm)
+    if not keys:
+        raise _error(422, "unknown_network", "networks must include at least one supported network")
+    return [_network(key) for key in keys]
+
+
+# ------------------------------------------------------- portfolio: chain reads
+
+
+async def _rpc(sem: asyncio.Semaphore, coro):
+    async with sem:
+        return await coro
+
+
+async def _chain_portfolio(http: httpx.AsyncClient, sem: asyncio.Semaphore, network: Network, address: str) -> dict:
+    """Native balance plus every allow-listed token balance for one network.
+
+    Every RPC failure is caught here and reported per-asset; nothing in this
+    function raises for a reason that belongs to the chain rather than the
+    buyer, matching the same money-safety rule `domain-trust-audit` follows
+    for its own checks."""
+    client = EvmClient(http, network.rpc_url)
+    tokens = TOKEN_ALLOWLIST.get(network.key, ())
+    results = await asyncio.gather(
+        _rpc(sem, client.call("eth_getBalance", [address, "latest"])),
+        *(_rpc(sem, client.token_balance(token_address, address)) for _, token_address, _ in tokens),
+        return_exceptions=True,
+    )
+    native_result, *token_results = results
+
+    if isinstance(native_result, Exception):
+        log.warning("house portfolio %s native: %s", network.key, native_result)
+        native = {"symbol": NATIVE_SYMBOL.get(network.key, "ETH"), "status": "error", "error": "rpc_failed"}
+    else:
+        units = int(native_result or "0x0", 16)
+        native = {
+            "symbol": NATIVE_SYMBOL.get(network.key, "ETH"),
+            "status": "ok",
+            "decimals": NATIVE_DECIMALS,
+            "balance": str(Decimal(units) / 10**NATIVE_DECIMALS),
+            "balance_units": units,
+        }
+
+    token_out = []
+    for (symbol, token_address, decimals), result in zip(tokens, token_results, strict=True):
+        if isinstance(result, Exception):
+            log.warning("house portfolio %s token %s: %s", network.key, symbol, result)
+            token_out.append({"symbol": symbol, "address": token_address, "status": "error", "error": "rpc_failed"})
+        else:
+            token_out.append(
+                {
+                    "symbol": symbol,
+                    "address": token_address,
+                    "status": "ok",
+                    "decimals": decimals,
+                    "balance": str(Decimal(result) / 10**decimals),
+                    "balance_units": result,
+                }
+            )
+
+    return {
+        "network": network.key,
+        "chain_id": network.chain_id,
+        "status": "ok",
+        "native": native,
+        "tokens": token_out,
+    }
+
+
+# ---------------------------------------------------------- portfolio: the endpoint
+
+
+@router.post("/portfolio")
+async def portfolio(request: Request):
+    """Native balance and a capped, allow-listed set of token balances for
+    one address, on one or more EVM networks (every configured network if
+    `networks` is omitted).
+
+    A chain that times out or whose RPC fails is reported as that chain's
+    `status`, never a 5xx for the whole call: the buyer still gets every
+    other network's answer and pays once."""
+    body = _parse(PortfolioIn, await authorized_input(request, "portfolio"))
+    if not ADDRESS_RE.match(body.address):
+        raise _error(422, "invalid_address", "address must be a 0x-prefixed 20-byte hex address")
+    address = body.address.lower()
+    networks = _portfolio_networks(body.networks)
+
+    cache_key = (address, tuple(sorted(network.key for network in networks)))
+    now = time.monotonic()
+    cached = _portfolio_cache.get(cache_key)
+    if cached is not None and cached[0] > now:
+        return {"output": cached[1]}
+
+    sem = asyncio.Semaphore(PORTFOLIO_RPC_CONCURRENCY)
+    deadline = now + PORTFOLIO_BUDGET_S
+
+    async def one_network(network: Network) -> dict:
+        left = min(PORTFOLIO_CHAIN_BUDGET_S, deadline - time.monotonic())
+        fallback = {
+            "network": network.key,
+            "chain_id": network.chain_id,
+            "status": "error",
+            "error": "the call's time budget was spent on other networks",
+            "native": None,
+            "tokens": [],
+        }
+        return await _bounded(_chain_portfolio(request.app.state.http, sem, network, address), left, fallback)
+
+    chains = await asyncio.gather(*(one_network(network) for network in networks))
+
+    output = {
+        "address": address,
+        "chains": chains,
+        "checked_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    if len(_portfolio_cache) > PORTFOLIO_CACHE_MAX:
+        _portfolio_cache.clear()
+    _portfolio_cache[cache_key] = (time.monotonic() + PORTFOLIO_CACHE_TTL_S, output)
+    return {"output": output}
