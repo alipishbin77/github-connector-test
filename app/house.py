@@ -124,6 +124,11 @@ async def _house_seller(service_id: str, slug: str) -> str:
         raise _unauthorized("unknown service_id")
     if urlparse(service.endpoint_url).path.rstrip("/") != f"{router.prefix}/{slug}":
         raise _unauthorized(f"service {service_id} is not listed against {router.prefix}/{slug}")
+    # Second gate, independent of the one in api.py: only the house agent may be paid for
+    # work this server performs. Listing is already restricted, but a listing that predates
+    # the setting — or any future path that skips that check — must still not earn here.
+    if not settings.house_agent_id or service.seller_id != settings.house_agent_id:
+        raise _unauthorized(f"service {service_id} is not owned by the house agent")
     return service.seller_id
 
 

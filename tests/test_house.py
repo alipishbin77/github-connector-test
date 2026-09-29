@@ -10,6 +10,7 @@ import json
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
 from app import auth, netguard
 from app.config import settings
@@ -61,9 +62,12 @@ async def web(app):
 
 
 @pytest.fixture
-async def house(client):
-    """One agent listing all three house services, as the operator would."""
+async def house(client, monkeypatch):
+    """One agent listing all three house services, as the operator would. It must
+    be registered as `house_agent_id`: only that agent may be paid for work this
+    server performs."""
     seller = await new_agent(client, "aether-house", ["sell_compute"])
+    monkeypatch.setattr(settings, "house_agent_id", seller["agent_id"])
     services = {}
     for slug in SLUGS:
         r = await client.post(
@@ -498,8 +502,9 @@ def strict_urls(monkeypatch):
     monkeypatch.setattr(settings, "public_base_url", f"https://{OWN_CGNAT}")
 
 
-async def test_house_endpoints_can_be_listed_behind_the_ssrf_guard(client, strict_urls):
+async def test_house_endpoints_can_be_listed_behind_the_ssrf_guard(client, strict_urls, monkeypatch):
     seller = await new_agent(client, "house-lister", ["sell_compute"])
+    monkeypatch.setattr(settings, "house_agent_id", seller["agent_id"])
     listing = {
         "name": "House: webpage to markdown",
         "description": "Run by the platform itself. No GPU, no LLM.",
@@ -525,3 +530,56 @@ async def test_house_endpoints_can_be_listed_behind_the_ssrf_guard(client, stric
     # The exemption is one origin and one path prefix: nothing else gets it.
     assert other_path.status_code == 422, other_path.text
     assert other_origin.status_code == 422, other_origin.text
+
+
+async def test_only_the_house_agent_may_list_a_house_endpoint(client, strict_urls, monkeypatch):
+    """Otherwise a stranger lists our own house endpoint as their own service at
+    any price and is paid for work this server performs at its own cost — and the
+    page fetcher becomes an open web proxy attributable to this host, billed to
+    whoever buys. The address exemption must be tied to the house agent."""
+    house_agent = await new_agent(client, "house-real", ["sell_compute"])
+    stranger = await new_agent(client, "house-impostor", ["sell_compute"])
+    monkeypatch.setattr(settings, "house_agent_id", house_agent["agent_id"])
+    listing = {
+        "name": "Totally my own service",
+        "description": "Reselling the platform's own compute as if it were mine.",
+        "category": "web",
+        "price_usd": "0.002",
+        "endpoint_url": f"https://{OWN_CGNAT}/v1/house/webpage-to-markdown",
+    }
+
+    assert (await client.post("/v1/services", headers=house_agent["headers"], json=listing)).status_code == 201
+    impostor = await client.post("/v1/services", headers=stranger["headers"], json=listing)
+    assert impostor.status_code == 422, impostor.text
+
+    # No house agent configured: nobody gets the exemption. Fail closed.
+    monkeypatch.setattr(settings, "house_agent_id", None)
+    unset = await client.post("/v1/services", headers=house_agent["headers"], json=listing)
+    assert unset.status_code == 422, unset.text
+
+
+async def test_house_call_rejects_a_service_not_owned_by_the_house_agent(client, monkeypatch):
+    """Second, independent gate. A listing made before the setting existed, or via
+    any future path that skips the listing check, must still not earn here."""
+    from app import house
+
+    monkeypatch.setattr(settings, "allow_private_seller_urls", True)  # let the listing itself through
+    stranger = await new_agent(client, "house-sneak", ["sell_compute"])
+    created = await client.post(
+        "/v1/services",
+        headers=stranger["headers"],
+        json={
+            "name": "Sneaky house reseller",
+            "description": "Listed against a house path without owning it.",
+            "category": "web",
+            "price_usd": "0.002",
+            "endpoint_url": "https://example.invalid/v1/house/webpage-to-markdown",
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    monkeypatch.setattr(settings, "house_agent_id", "agt_someone_else_entirely")
+    with pytest.raises(HTTPException) as caught:
+        await house._house_seller(created.json()["service_id"], "webpage-to-markdown")
+    assert caught.value.status_code == 401
+    assert "not owned by the house agent" in str(caught.value.detail)
