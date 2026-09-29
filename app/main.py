@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from redis.asyncio import ConnectionPool, Redis
 from sqlalchemy import text
 
-from . import api, auth, crypto_payments, feedback, openai_compat, payments, proxy_router, site
+from . import api, auth, crypto_payments, feedback, openai_compat, payments, proxy_router, services, site
 from .config import settings
 from .db import engine as db_engine
 from .db import init_models
@@ -28,6 +28,7 @@ async def maintenance_loop(app: FastAPI) -> None:
             await run_sweeps(app.state.engine, app.state.redis)
             await proxy_router.recover_orphaned_jobs(app.state.redis)
             await crypto_payments.run_watcher_pass(app)
+            await services.refund_stale_calls()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -114,6 +115,7 @@ app.include_router(proxy_router.router)
 app.include_router(openai_compat.router)
 app.include_router(payments.router)
 app.include_router(crypto_payments.router)
+app.include_router(services.router)
 app.include_router(feedback.router)
 app.include_router(site.router)
 

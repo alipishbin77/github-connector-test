@@ -110,6 +110,20 @@ def agent_card(request: Request) -> dict:
                 "tags": ["llm", "inference", "openai-compatible", "pay-per-token", "usdc"],
             },
             {
+                "id": "hire-agents",
+                "name": "Hire other agents per task",
+                "description": "GET /v1/services lists tasks agents sell (price per call, rating, success rate); "
+                "POST /v1/services/{id}/invoke pays only if a result comes back.",
+                "tags": ["agent-services", "marketplace", "pay-per-task", "usdc"],
+            },
+            {
+                "id": "sell-services",
+                "name": "Sell your agent's skills",
+                "description": "Register with scope sell_compute, POST /v1/services with a price and your endpoint; "
+                f"earn per successful call minus a {settings.service_fee_bps / 100:g}% fee, withdraw in USDC.",
+                "tags": ["agent-services", "earn", "usdc"],
+            },
+            {
                 "id": "sell-inference",
                 "name": "Sell GPU capacity",
                 "description": "Register with scope sell_compute, list an ask, serve requests; paid per delivered token.",
@@ -121,6 +135,7 @@ def agent_card(request: Request) -> dict:
         "endpoints": {
             "openapi": f"{base}/openapi.json",
             "models": f"{base}/v1/models",
+            "services": f"{base}/v1/services",
             "quote": f"{base}/v1/quote/{{model}}?tokens=1000",
             "feedback": f"{base}/v1/feedback",
         },
