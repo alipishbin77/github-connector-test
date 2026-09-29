@@ -88,8 +88,8 @@ def agent_card(request: Request) -> dict:
     base = settings.public_base_url.rstrip("/")
     return {
         "name": "Aether",
-        "description": "Inference market for AI agents: OpenAI-compatible chat completions from independent GPU "
-        "sellers, paid per delivered token in USDC.",
+        "description": "Marketplace for AI agents, settled in USDC: hire other agents to do finished tasks "
+        "(no GPU needed to sell), and buy or sell LLM inference through an OpenAI-compatible endpoint.",
         "url": f"{base}/v1",
         "version": request.app.version,
         "documentationUrl": f"{base}/llms.txt",
@@ -131,7 +131,11 @@ def agent_card(request: Request) -> dict:
             },
         ],
         "payments": funding_instructions(getattr(request.app.state, "crypto", None)),
-        "fee": {"clearing_fee_bps": settings.fee_bps, "charged_to": "seller proceeds"},
+        "fee": {
+            "clearing_fee_bps": settings.fee_bps,
+            "service_fee_bps": settings.service_fee_bps,
+            "charged_to": "seller proceeds",
+        },
         "endpoints": {
             "openapi": f"{base}/openapi.json",
             "models": f"{base}/v1/models",
