@@ -11,7 +11,9 @@ address rules. A previous PR broke because CI resolves differently from the
 box this runs on.
 """
 
+import asyncio
 import hashlib
+import inspect
 import ipaddress
 import json
 import socket
@@ -45,8 +47,8 @@ PRIVATE_HOSTS = [
     "192.168.1.1",
 ]
 
-SLUGS = ("webpage-to-markdown", "json-schema-validate", "usdc-balance", "domain-trust-audit", "portfolio")
-PRICE_USD = {"domain-trust-audit": "0.10"}  # the audit is the one house service that is not a fraction of a cent
+SLUGS = ("webpage-to-markdown", "json-schema-validate", "usdc-balance", "domain-trust-audit", "portfolio", "sitemap-to-markdown")
+PRICE_USD = {"domain-trust-audit": "0.10", "sitemap-to-markdown": "0.35"}
 
 
 # ------------------------------------------------------------------- fixtures
@@ -64,7 +66,10 @@ class FakeWeb:
         handler = self.responses.get(request.url.path)
         if handler is None:
             return httpx.Response(404, text="no such page")
-        return handler(request)
+        result = handler(request)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
 
 @pytest.fixture
@@ -1305,3 +1310,225 @@ def test_hostname_matching_follows_one_wildcard_label():
     assert not app_house._hostname_matches("b.a.example.com", ["*.example.com"])
     assert not app_house._hostname_matches("example.com", ["*.example.com"])
     assert not app_house._hostname_matches("example.com.evil.test", ["example.com"])
+
+
+# ------------------------------------------------------- sitemap-to-markdown
+
+OFFSITE = "1.1.1.1"  # a second public address; if the crawler ever fetched it, this would prove it
+
+
+@pytest.fixture
+def sitemap_ready(monkeypatch):
+    """Sitemap tests don't want the real test host's memory, or the polite
+    one-request-per-second pacing, deciding whether they pass."""
+    monkeypatch.setattr(app_house, "_available_memory_mb", lambda: 2048.0)
+    monkeypatch.setattr(app_house, "SITEMAP_RATE_LIMIT_S", 0.0)
+
+
+def sitemap_xml(*locs: str) -> str:
+    body = "".join(f"<url><loc>{loc}</loc></url>" for loc in locs)
+    return f'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{body}</urlset>'
+
+
+PAGE_WITH_LINKS = f"""
+<html><head><title>Root</title></head>
+<body>
+  <main>
+    <h1>Root page</h1>
+    <p>Some content long enough that main is clearly the real body of this page.</p>
+    <a href="/b">same-origin link</a>
+    <a href="http://{OFFSITE}/offsite">off-site link</a>
+  </main>
+</body></html>
+"""
+
+PAGE_B = """
+<html><head><title>B</title></head>
+<body><main><p>Page B, with enough text that main is trusted as the content.</p></main></body></html>
+"""
+
+
+async def test_sitemap_reads_every_page_listed(client, house, web, sitemap_ready):
+    web.responses["/sitemap.xml"] = lambda r: httpx.Response(
+        200, headers={"content-type": "application/xml"}, text=sitemap_xml(f"http://{PUBLIC}/a", f"http://{PUBLIC}/b")
+    )
+    web.responses["/a"] = lambda r: httpx.Response(200, headers={"content-type": "text/html"}, text=PAGE)
+    web.responses["/b"] = lambda r: httpx.Response(200, headers={"content-type": "text/html"}, text=PAGE_B)
+
+    r = await invoke(client, house, "sitemap-to-markdown", {"sitemap_url": f"http://{PUBLIC}/sitemap.xml"})
+
+    assert r.status_code == 200, r.text
+    out = r.json()["output"]
+    assert out["source"] == "sitemap"
+    assert out["pages_fetched"] == 2
+    assert out["pages_attempted"] == 2
+    assert out["truncated"] is False
+    urls = {p["url"] for p in out["pages"]}
+    assert urls == {f"http://{PUBLIC}/a", f"http://{PUBLIC}/b"}
+    assert all(p["status"] == "ok" for p in out["pages"])
+    assert any("# Agents hire agents" in p["markdown"] for p in out["pages"])
+
+
+async def test_sitemap_page_cap_is_enforced(client, house, web, sitemap_ready):
+    locs = [f"http://{PUBLIC}/page{i}" for i in range(5)]
+    web.responses["/sitemap.xml"] = lambda r: httpx.Response(
+        200, headers={"content-type": "application/xml"}, text=sitemap_xml(*locs)
+    )
+    for i in range(5):
+        web.responses[f"/page{i}"] = lambda r: httpx.Response(200, headers={"content-type": "text/html"}, text=PAGE_B)
+
+    r = await invoke(client, house, "sitemap-to-markdown", {"sitemap_url": f"http://{PUBLIC}/sitemap.xml", "max_pages": 2})
+
+    assert r.status_code == 200, r.text
+    out = r.json()["output"]
+    assert out["pages_attempted"] == 2
+    assert out["truncated"] is True
+
+
+async def test_sitemap_hard_ceiling_holds_even_if_more_is_requested(client, house, web, sitemap_ready):
+    assert app_house.SITEMAP_MAX_PAGES < 60  # sanity: the request below asks for more than the ceiling allows
+    r = await invoke(client, house, "sitemap-to-markdown", {"sitemap_url": f"http://{PUBLIC}/sitemap.xml", "max_pages": 999})
+    assert r.status_code == 422  # rejected by SitemapIn's own field bound, before any fetch
+    assert web.requested == []
+
+
+async def test_sitemap_respects_robots_disallow(client, house, web, sitemap_ready):
+    web.responses["/robots.txt"] = lambda r: httpx.Response(200, text="User-agent: *\nDisallow: /b\n")
+    web.responses["/sitemap.xml"] = lambda r: httpx.Response(
+        200, headers={"content-type": "application/xml"}, text=sitemap_xml(f"http://{PUBLIC}/a", f"http://{PUBLIC}/b")
+    )
+    web.responses["/a"] = lambda r: httpx.Response(200, headers={"content-type": "text/html"}, text=PAGE)
+    web.responses["/b"] = lambda r: httpx.Response(200, headers={"content-type": "text/html"}, text=PAGE_B)
+
+    r = await invoke(client, house, "sitemap-to-markdown", {"sitemap_url": f"http://{PUBLIC}/sitemap.xml"})
+
+    assert r.status_code == 200, r.text
+    out = r.json()["output"]
+    assert {p["url"] for p in out["pages"]} == {f"http://{PUBLIC}/a"}
+    assert f"http://{PUBLIC}/b" not in web.requested  # skipped outright, never fetched
+
+
+async def test_crawl_follows_same_origin_links_only(client, house, web, sitemap_ready):
+    web.responses["/"] = lambda r: httpx.Response(200, headers={"content-type": "text/html"}, text=PAGE_WITH_LINKS)
+    web.responses["/b"] = lambda r: httpx.Response(200, headers={"content-type": "text/html"}, text=PAGE_B)
+
+    r = await invoke(client, house, "sitemap-to-markdown", {"url": f"http://{PUBLIC}/"})
+
+    assert r.status_code == 200, r.text
+    out = r.json()["output"]
+    assert out["source"] == "crawl"
+    urls = {p["url"] for p in out["pages"]}
+    assert urls == {f"http://{PUBLIC}/", f"http://{PUBLIC}/b"}
+    assert f"http://{OFFSITE}/offsite" not in web.requested
+
+
+async def test_crawl_reports_a_failed_page_without_failing_the_whole_call(client, house, web, sitemap_ready):
+    def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("too slow", request=request)
+
+    web.responses["/"] = lambda r: httpx.Response(200, headers={"content-type": "text/html"}, text=PAGE_WITH_LINKS)
+    web.responses["/b"] = timeout
+
+    r = await invoke(client, house, "sitemap-to-markdown", {"url": f"http://{PUBLIC}/"})
+
+    assert r.status_code == 200, r.text
+    out = r.json()["output"]
+    assert out["pages_fetched"] == 1
+    assert out["pages_attempted"] == 2
+    root = next(p for p in out["pages"] if p["url"] == f"http://{PUBLIC}/")
+    failed = next(p for p in out["pages"] if p["url"] == f"http://{PUBLIC}/b")
+    assert root["status"] == "ok"
+    assert failed["status"] == "error"
+    assert failed["error"] == "fetch_timeout"
+
+
+async def test_crawl_reports_a_discovered_link_refused_by_netguard_per_page(client, house, web, sitemap_ready):
+    """The core SSRF property: a link found on an already-fetched page is
+    checked exactly like the seed URL, hop by hop — and a refusal there costs
+    that one page, not the whole call."""
+    web.responses["/"] = lambda r: httpx.Response(200, headers={"content-type": "text/html"}, text=PAGE_WITH_LINKS)
+    web.responses["/b"] = lambda r: httpx.Response(302, headers={"location": "http://169.254.169.254/latest/meta-data/"})
+
+    r = await invoke(client, house, "sitemap-to-markdown", {"url": f"http://{PUBLIC}/"})
+
+    assert r.status_code == 200, r.text
+    out = r.json()["output"]
+    root = next(p for p in out["pages"] if p["url"] == f"http://{PUBLIC}/")
+    refused = next(p for p in out["pages"] if p["url"] == f"http://{PUBLIC}/b")
+    assert root["status"] == "ok"
+    assert refused["status"] == "error"
+    assert refused["error"] == "refused_url"
+    assert "169.254.169.254" not in str(web.requested)  # the metadata service itself was never contacted
+
+
+@pytest.mark.parametrize("host", PRIVATE_HOSTS)
+async def test_sitemap_refuses_an_unsafe_seed_before_any_fetch(client, house, web, sitemap_ready, host):
+    r = await invoke(client, house, "sitemap-to-markdown", {"url": f"http://{host}/"}, call_id=f"sitemap-ssrf-{host}")
+
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["error"] == "refused_url"
+    assert web.requested == []
+
+
+async def test_sitemap_input_requires_exactly_one_of_sitemap_url_or_url(client, house, web, sitemap_ready):
+    both = await invoke(
+        client, house, "sitemap-to-markdown", {"sitemap_url": f"http://{PUBLIC}/s.xml", "url": f"http://{PUBLIC}/"}
+    )
+    neither = await invoke(client, house, "sitemap-to-markdown", {}, call_id="neither")
+
+    assert both.status_code == 422
+    assert both.json()["detail"]["error"] == "invalid_input"
+    assert neither.status_code == 422
+    assert neither.json()["detail"]["error"] == "invalid_input"
+    assert web.requested == []
+
+
+async def test_sitemap_refuses_to_start_below_the_memory_floor(client, house, web, monkeypatch):
+    monkeypatch.setattr(app_house, "_available_memory_mb", lambda: 100.0)
+
+    r = await invoke(client, house, "sitemap-to-markdown", {"url": f"http://{PUBLIC}/"})
+
+    assert r.status_code == 503, r.text
+    assert r.json()["detail"]["error"] == "insufficient_memory"
+    assert web.requested == []
+
+
+async def test_sitemap_second_concurrent_call_gets_busy_response(client, house, web, sitemap_ready):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_robots(request: httpx.Request) -> httpx.Response:
+        started.set()
+        await release.wait()
+        return httpx.Response(404, text="no robots.txt")
+
+    web.responses["/robots.txt"] = slow_robots
+    web.responses["/"] = lambda r: httpx.Response(200, headers={"content-type": "text/html"}, text=PAGE_B)
+
+    first_task = asyncio.ensure_future(invoke(client, house, "sitemap-to-markdown", {"url": f"http://{PUBLIC}/"}))
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    second = await invoke(client, house, "sitemap-to-markdown", {"url": f"http://{PUBLIC}/"}, call_id="second-crawl")
+    assert second.status_code == 429, second.text
+    assert second.json()["detail"]["error"] == "crawler_busy"
+
+    release.set()
+    first = await asyncio.wait_for(first_task, timeout=5)
+    assert first.status_code == 200, first.text
+
+
+def test_sitemap_index_children_are_followed(monkeypatch):
+    assert app_house._is_sitemap_index(
+        '<?xml version="1.0"?><sitemapindex xmlns="x"><sitemap><loc>a</loc></sitemap></sitemapindex>'
+    )
+    assert not app_house._is_sitemap_index(sitemap_xml("http://x/a"))
+
+
+def test_extract_same_origin_links_drops_offsite_and_non_http():
+    links = app_house._extract_same_origin_links(
+        f'<a href="/rel">r</a><a href="http://{PUBLIC}/abs">a</a>'
+        f'<a href="http://{OFFSITE}/x">off</a><a href="javascript:void(0)">js</a><a href="mailto:a@b.test">mail</a>',
+        base_url=f"http://{PUBLIC}/",
+        origin=f"http://{PUBLIC}",
+    )
+    assert links == [f"http://{PUBLIC}/rel", f"http://{PUBLIC}/abs"]
