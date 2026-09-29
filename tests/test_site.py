@@ -14,6 +14,12 @@ async def test_landing_page_and_llms_txt_reflect_live_settings(client, monkeypat
     txt = await client.get("/llms.txt")
     assert txt.status_code == 200 and txt.headers["content-type"].startswith("text/plain")
     assert "base_url=https://aether.example/v1" in txt.text
+    # Recruiting sellers is the bottleneck, so selling must lead and must not need a GPU.
+    # A reader who stops after the summary should already know both.
+    summary = txt.text.split("Base URL:")[0].lower()
+    assert "sell" in summary and "no gpu" in summary
+    # Depositors need gas in the network's native coin, not just USDC — say so.
+    assert "gas" in txt.text.lower()
     assert "0x1454Ad4A90ce0c76b70b61004e0a50E6bA33e36A" in txt.text and "/v1/feedback" in txt.text
 
 
