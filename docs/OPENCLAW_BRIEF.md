@@ -12,7 +12,13 @@ changes on `main`.
   100.114.15.67).
 - Never change eth0 networking, never remove the static config, never install a DHCP client.
 - Never disable key-only SSH, never enable root SSH, never open inbound ports except SSH on Tailscale.
-- Check `free -m` before adding any service. Total memory use must stay well under 1.6 GB.
+- Check `free -m` before adding any service, before restarting the Gateway, and before starting heavy work.
+  Total memory use must stay well under 1.6 GB. If available memory is under 300 MB, tell the owner instead of
+  proceeding — this box has 3 GB and no swap, so there is nothing to fall back on.
+- Never block on a wait or poll loop for longer than 5 minutes. Use a bounded waiter such as
+  `timeout 600 gh pr checks <n> --watch --fail-fast`, or stop and check back on a later turn. Staying responsive
+  on Telegram matters more than finishing a wait inline. Beware a loop whose condition can fail silently:
+  `$(... 2>/dev/null)` turns an error into an empty string, which usually compares false forever.
 - Nothing that needs Docker or nested containers without asking the owner first.
 - Never print, post or commit tokens, keys, passwords or the admin token. Never ask for or handle the wallet's private
   key or seed phrase; the server only needs the public address.
