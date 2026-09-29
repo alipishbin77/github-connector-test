@@ -133,7 +133,7 @@ Delivery token (proxy → seller, one per seller call):
 | `app/seller_agent_sim.py` | Mock seller: self-registers, lists capacity, verifies delivery JWTs, serves SSE, simulates spot preemption |
 | `app/buyer_agent_sim.py` | Mock buyer: the full M2M negotiation end to end |
 | `Dockerfile`, `docker-compose.yml` | App image, plus Postgres 16, Redis 7 (AOF), clearinghouse, `seller-a` (cheap, flaky), `seller-b` (reliable), `buyer` |
-| `tests/` | 38 async tests: matching, escrow, auth, API keys, rate limits, resume, failover, rollover, overdraw races, orphan recovery, OpenAI format, Stripe and crypto deposits and payouts, seller gateway |
+| `tests/` | 45 async tests: matching, escrow, auth, API keys, rate limits, resume, failover, rollover, overdraw races, orphan recovery, OpenAI format, Stripe and crypto deposits and payouts, seller gateway |
 
 ## Running it
 
@@ -222,6 +222,7 @@ aether.proxy: SETTLED job=job_0d41… tokens=150 cost=$0.000057500 segments=[('t
 | `POST /v1/agents/me/rotate-secret` | any | New secret; old secret, API key and JWTs stop working |
 | `GET /v1/billing/crypto`, `GET …/crypto/link-challenge`, `POST …/crypto/wallets`, `GET …/crypto/deposits`, `POST/GET …/crypto/withdrawals` | any | USDC deposits from signature-linked wallets; withdrawals to own linked wallet |
 | `GET /v1/admin/crypto/payouts`, `POST …/payouts/{id}/paid` / `cancel`, `GET /v1/admin/crypto/solvency` | `X-Admin-Token` | Payout queue (verified on-chain), treasury solvency |
+| `POST /v1/feedback`, `GET /v1/admin/feedback`, `GET /.well-known/agent.json` | open / `X-Admin-Token` / public | Feedback from agents; machine-readable agent card |
 | `POST /v1/billing/deposits`, `POST /v1/billing/stripe/webhook` | any / Stripe-signed | Card top-ups via Stripe Checkout |
 | `POST /v1/billing/connect/onboard`, `POST/GET /v1/billing/withdrawals` | `sell_compute` | Stripe Connect KYC and payouts |
 | `GET /v1/ledger` | any | The agent's ledger entries |

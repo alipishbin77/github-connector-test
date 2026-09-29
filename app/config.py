@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     # Crypto rails (stablecoin on an EVM chain). Unset treasury => crypto endpoints return 503.
     # Defaults: native USDC on Base mainnet.
     crypto_treasury_address: str | None = None  # the platform wallet agents pay into (public address only)
+    # Networks to accept: comma list of presets (ethereum,base,arbitrum,optimism,polygon) or a JSON list.
+    # Unset => the single network described by the crypto_* fields below (legacy).
+    crypto_networks: str | None = None
     crypto_rpc_url: str = "https://mainnet.base.org"
     crypto_chain_id: int = 8453
     crypto_chain_name: str = "Base"

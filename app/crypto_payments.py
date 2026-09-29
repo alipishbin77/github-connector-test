@@ -1,33 +1,35 @@
-"""Crypto rails: agents pay in a stablecoin (default USDC on Base) to one
+"""Crypto rails: agents pay in USDC on any supported EVM network to ONE
 platform treasury address; the platform keeps its fee and pays sellers out.
 
+  Networks      AETHER_CRYPTO_NETWORKS="ethereum,base,arbitrum,optimism,polygon"
+                (presets for native USDC), or a JSON list for custom tokens.
+                The same treasury address receives on every network, so it
+                must be a plain wallet (EOA) that Ali controls on all of them.
   Link wallet   An agent proves it controls an address by signing a one-time
-                challenge (EIP-191 personal_sign). Only then are transfers from
-                that address credited to it, so nobody can claim someone
-                else's deposit.
-  Deposits      A watcher polls the chain for token Transfer events into the
-                treasury. After N confirmations each one is recorded once
-                (key: chain:tx:log_index). From a linked wallet it is credited
-                (house:crypto_deposits -> agent available); from an unknown
-                sender it is held as "unattributed" and credited automatically
-                if that sender links later.
-  Payouts       An agent withdraws to one of its own linked wallets. The
-                ledger debits it immediately (-> house:crypto_payable). The
-                server holds no private key: the operator sends the transfer
-                from the treasury and submits the tx hash, and the payout is
-                marked paid only after the transfer is verified on-chain
-                (right token, from treasury, to that address, exact amount,
-                enough confirmations). Cancelling refunds the agent.
-  Commission    The clearing fee accrues in house:fees; the USDC itself stays
-                in the treasury. GET /v1/admin/crypto/solvency compares the
-                on-chain balance with everything owed.
+                challenge (EIP-191). Linking once covers every network.
+                Only then are transfers from that address credited to it.
+  Deposits      One watcher per network polls token Transfer events into the
+                treasury and records each once (key chain:tx:log_index) after
+                that network's confirmations. From a linked wallet it is
+                credited; from an unknown sender it is held "unattributed" and
+                credited automatically if that sender links later.
+  Payouts       Withdrawals go only to the agent's own linked wallet, on the
+                network it picks (default: cheapest configured). The ledger
+                debits it immediately. The server holds no private key: the
+                operator sends from the treasury and the payout is marked paid
+                only after the transfer is verified on that network.
+  Commission    The fee accrues in house:fees; the USDC stays in the treasury.
+                GET /v1/admin/crypto/solvency sums on-chain balances across
+                networks and compares them with everything owed.
 """
 
 import hmac
+import json
 import logging
 import re
 import secrets
 import time
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 import httpx
@@ -52,6 +54,100 @@ BALANCE_OF = "0x70a08231"
 ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 
+@dataclass(frozen=True)
+class Network:
+    key: str
+    name: str
+    chain_id: int
+    rpc_url: str
+    token_address: str
+    token_symbol: str = "USDC"
+    decimals: int = 6
+    confirmations: int = 12
+    max_block_range: int = 500
+
+    @property
+    def nanos_per_unit(self) -> int:
+        return NANOS_PER_USD // 10**self.decimals
+
+    def to_nanos(self, units: int) -> int:
+        return units * self.nanos_per_unit
+
+    def fmt(self, units: int) -> str:
+        return f"{Decimal(units) / 10**self.decimals} {self.token_symbol} on {self.name}"
+
+    def public(self) -> dict:
+        return {
+            "network": self.key,
+            "name": self.name,
+            "chain_id": self.chain_id,
+            "token": self.token_symbol,
+            "token_contract": self.token_address,
+            "decimals": self.decimals,
+            "confirmations": self.confirmations,
+        }
+
+
+# Native (Circle-issued) USDC. Bridged variants such as USDC.e are NOT credited.
+PRESETS: dict[str, Network] = {
+    "ethereum": Network("ethereum", "Ethereum", 1, "https://ethereum-rpc.publicnode.com",
+                        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", confirmations=12, max_block_range=500),
+    "base": Network("base", "Base", 8453, "https://base-rpc.publicnode.com",
+                    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", confirmations=10, max_block_range=1000),
+    "arbitrum": Network("arbitrum", "Arbitrum One", 42161, "https://arbitrum-one-rpc.publicnode.com",
+                        "0xaf88d065e77c8cc2239327c5edb3a432268e5831", confirmations=240, max_block_range=5000),
+    "optimism": Network("optimism", "OP Mainnet", 10, "https://optimism-rpc.publicnode.com",
+                        "0x0b2c639c533813f4aa9d7837caf62653d097ff85", confirmations=10, max_block_range=1000),
+    "polygon": Network("polygon", "Polygon PoS", 137, "https://polygon-bor-rpc.publicnode.com",
+                       "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359", confirmations=128, max_block_range=1000),
+}  # fmt: skip
+
+# Default network for payouts when the agent doesn't pick one: cheapest first.
+PAYOUT_PREFERENCE = ["base", "arbitrum", "optimism", "polygon", "ethereum"]
+
+
+def configured_networks() -> list[Network]:
+    """Networks enabled on this clearinghouse (empty when no treasury is set)."""
+    if not settings.crypto_treasury_address:
+        return []
+    spec = (settings.crypto_networks or "").strip()
+    if not spec:  # legacy single-network settings
+        return [
+            Network(
+                key=settings.crypto_chain_name.lower().replace(" ", "-"),
+                name=settings.crypto_chain_name,
+                chain_id=settings.crypto_chain_id,
+                rpc_url=settings.crypto_rpc_url,
+                token_address=settings.crypto_token_address.lower(),
+                token_symbol=settings.crypto_token_symbol,
+                decimals=settings.crypto_token_decimals,
+                confirmations=settings.crypto_confirmations,
+                max_block_range=settings.crypto_max_block_range,
+            )
+        ]
+    if spec.startswith("["):
+        networks = []
+        for item in json.loads(spec):
+            base = PRESETS[item["preset"]] if "preset" in item else None
+            fields = {k: v for k, v in item.items() if k != "preset"}
+            net = replace(base, **fields) if base else Network(**fields)
+            networks.append(replace(net, token_address=net.token_address.lower()))
+        return networks
+    return [PRESETS[name.strip().lower()] for name in spec.split(",") if name.strip()]
+
+
+def validate_networks(networks: list[Network]) -> None:
+    if not ADDRESS_RE.match(settings.crypto_treasury_address or ""):
+        raise RuntimeError("AETHER_CRYPTO_TREASURY_ADDRESS is not a valid 0x address")
+    seen = set()
+    for net in networks:
+        if net.decimals > 9:
+            raise RuntimeError(f"{net.name}: tokens with more than 9 decimals are not supported by the nano-USD ledger")
+        if net.chain_id in seen:
+            raise RuntimeError(f"network chain id {net.chain_id} configured twice")
+        seen.add(net.chain_id)
+
+
 def norm_address(value: str) -> str:
     if not ADDRESS_RE.match(value or ""):
         raise HTTPException(422, detail="not a 0x-prefixed 20-byte address")
@@ -66,16 +162,8 @@ def address_from_topic(topic: str) -> str:
     return "0x" + topic[-40:].lower()
 
 
-def nanos_per_unit() -> int:
-    return NANOS_PER_USD // 10**settings.crypto_token_decimals
-
-
-def units_to_nanos(units: int) -> int:
-    return units * nanos_per_unit()
-
-
-def fmt_token(units: int) -> str:
-    return f"{Decimal(units) / 10**settings.crypto_token_decimals} {settings.crypto_token_symbol}"
+def chain_of_deposit(deposit_id: str) -> int:
+    return int(deposit_id.split(":", 1)[0])
 
 
 class ChainError(Exception):
@@ -89,16 +177,6 @@ class EvmClient:
         self.http = http
         self.url = url
         self._id = 0
-
-    @classmethod
-    def create(cls) -> "EvmClient | None":
-        if not settings.crypto_treasury_address:
-            return None
-        if not ADDRESS_RE.match(settings.crypto_treasury_address):
-            raise RuntimeError("AETHER_CRYPTO_TREASURY_ADDRESS is not a valid 0x address")
-        if settings.crypto_token_decimals > 9:
-            raise RuntimeError("tokens with more than 9 decimals are not supported by the nano-USD ledger")
-        return cls(httpx.AsyncClient(timeout=httpx.Timeout(15.0)), settings.crypto_rpc_url)
 
     async def call(self, method: str, params: list):
         self._id += 1
@@ -134,15 +212,85 @@ class EvmClient:
         data = BALANCE_OF + "0" * 24 + holder[2:].lower()
         return int(await self.call("eth_call", [{"to": token, "data": data}, "latest"]) or "0x0", 16)
 
+    async def code(self, address: str) -> str:
+        return await self.call("eth_getCode", [address, "latest"]) or "0x"
+
     async def aclose(self) -> None:
         await self.http.aclose()
 
 
-def _chain(request: Request) -> EvmClient:
-    client = getattr(request.app.state, "chain", None)
-    if client is None:
+@dataclass
+class Rail:
+    """One network's client + deposit watcher."""
+
+    network: Network
+    client: EvmClient
+    watcher: "DepositWatcher"
+
+
+class CryptoRails:
+    def __init__(self, rails: dict[int, Rail]):
+        self.rails = rails
+
+    @classmethod
+    def create(cls) -> "CryptoRails | None":
+        networks = configured_networks()
+        if not networks:
+            return None
+        validate_networks(networks)
+        rails = {}
+        for net in networks:
+            client = EvmClient(httpx.AsyncClient(timeout=httpx.Timeout(15.0)), net.rpc_url)
+            rails[net.chain_id] = Rail(net, client, DepositWatcher(net, client))
+        return cls(rails)
+
+    def network(self, chain_id: int) -> Network | None:
+        rail = self.rails.get(chain_id)
+        return rail.network if rail else None
+
+    def pick(self, choice: str | int | None) -> Rail:
+        if choice is None:
+            by_key = {r.network.key: r for r in self.rails.values()}
+            for key in PAYOUT_PREFERENCE:
+                if key in by_key:
+                    return by_key[key]
+            return next(iter(self.rails.values()))
+        for rail in self.rails.values():
+            if str(choice).lower() in (rail.network.key, str(rail.network.chain_id), rail.network.name.lower()):
+                return rail
+        raise HTTPException(
+            422, detail=f"unsupported network {choice!r}; use one of {[r.network.key for r in self.rails.values()]}"
+        )
+
+    async def aclose(self) -> None:
+        for rail in self.rails.values():
+            await rail.client.aclose()
+
+
+def _rails(request: Request) -> CryptoRails:
+    rails = getattr(request.app.state, "crypto", None)
+    if rails is None:
         raise HTTPException(503, detail="crypto payments are not configured on this clearinghouse")
-    return client
+    return rails
+
+
+def funding_instructions(rails: "CryptoRails | None" = None) -> dict | None:
+    """Machine-readable 'how to pay us', embedded in 402 responses and discovery docs."""
+    networks = [r.network for r in rails.rails.values()] if rails else configured_networks()
+    if not networks:
+        return None
+    return {
+        "method": "crypto",
+        "treasury_address": settings.crypto_treasury_address,
+        "networks": [n.public() for n in networks],
+        "steps": [
+            "GET /v1/billing/crypto/link-challenge?address=<your 0x wallet>",
+            "sign the returned message with that wallet (EIP-191 personal_sign)",
+            "POST /v1/billing/crypto/wallets {address, nonce, signature}",
+            "send native USDC on any listed network from that wallet to treasury_address",
+            "balance is credited after the network's confirmations: GET /v1/agents/me",
+        ],
+    }
 
 
 def require_admin(x_admin_token: str | None) -> None:
@@ -154,7 +302,14 @@ def require_admin(x_admin_token: str | None) -> None:
 # ------------------------------------------------------------------- deposits
 
 
-async def record_deposit(deposit_id: str, tx_hash: str, from_address: str, units: int, block: int) -> str | None:
+def _deposit_nanos(deposit: CryptoDeposit, network: Network | None) -> int:
+    decimals = network.decimals if network else 6
+    return deposit.amount_units * (NANOS_PER_USD // 10**decimals)
+
+
+async def record_deposit(
+    network: Network, deposit_id: str, tx_hash: str, from_address: str, units: int, block: int
+) -> str | None:
     """Idempotently record one Transfer into the treasury; credit it if the
     sender is a linked wallet. Returns the new status, or None if already seen."""
     try:
@@ -174,15 +329,16 @@ async def record_deposit(deposit_id: str, tx_hash: str, from_address: str, units
             session.add(deposit)
             await session.flush()
             if wallet:
-                _credit(session, await ledger.lock_agents(session, [wallet.agent_id]), deposit)
+                _credit(session, await ledger.lock_agents(session, [wallet.agent_id]), deposit, network)
     except IntegrityError:
         return None  # a concurrent watcher recorded it first
-    log.info("DEPOSIT %s %s from %s tx=%s", deposit.status, fmt_token(units), from_address, tx_hash)
+    log.info("DEPOSIT %s %s from %s tx=%s", deposit.status, network.fmt(units), from_address, tx_hash)
     return deposit.status
 
 
-def _credit(session, agents, deposit: CryptoDeposit) -> None:
-    nanos = units_to_nanos(deposit.amount_units)
+def _credit(session, agents, deposit: CryptoDeposit, network: Network | None) -> None:
+    nanos = _deposit_nanos(deposit, network)
+    label = network.fmt(deposit.amount_units) if network else f"{deposit.amount_units} units"
     ledger.post(
         session,
         agents,
@@ -190,13 +346,14 @@ def _credit(session, agents, deposit: CryptoDeposit) -> None:
         kind="deposit",
         ref_type="crypto",
         ref_id=deposit.id,
-        memo=f"{fmt_token(deposit.amount_units)} tx {deposit.tx_hash}",
+        memo=f"{label} tx {deposit.tx_hash}",
     )
 
 
 class DepositWatcher:
-    def __init__(self, chain: EvmClient):
-        self.chain = chain
+    def __init__(self, network: Network, client: EvmClient):
+        self.network = network
+        self.client = client
         self._next_run = 0.0
 
     async def maybe_poll(self) -> None:
@@ -206,14 +363,14 @@ class DepositWatcher:
         await self.poll()
 
     async def poll(self, max_batches: int = 20) -> int:
+        net = self.network
         treasury = settings.crypto_treasury_address.lower()
-        token = settings.crypto_token_address.lower()
-        safe = await self.chain.block_number() - settings.crypto_confirmations
+        safe = await self.client.block_number() - net.confirmations
         async with SessionLocal() as session, session.begin():
-            cursor = await session.get(ChainCursor, settings.crypto_chain_id)
+            cursor = await session.get(ChainCursor, net.chain_id)
             if cursor is None:
                 start = settings.crypto_start_block if settings.crypto_start_block is not None else safe
-                cursor = ChainCursor(chain_id=settings.crypto_chain_id, last_block=start - 1)
+                cursor = ChainCursor(chain_id=net.chain_id, last_block=start - 1)
                 session.add(cursor)
             last = cursor.last_block
         seen = 0
@@ -221,14 +378,15 @@ class DepositWatcher:
             frm = last + 1
             if frm > safe:
                 break
-            to = min(safe, frm + settings.crypto_max_block_range - 1)
-            for entry in await self.chain.transfers_to(token, treasury, frm, to):
+            to = min(safe, frm + net.max_block_range - 1)
+            for entry in await self.client.transfers_to(net.token_address, treasury, frm, to):
                 if entry.get("removed"):
                     continue
-                if entry["address"].lower() != token or entry["topics"][0] != TRANSFER_TOPIC:
+                if entry["address"].lower() != net.token_address or entry["topics"][0] != TRANSFER_TOPIC:
                     continue
-                deposit_id = f"{settings.crypto_chain_id}:{entry['transactionHash'].lower()}:{int(entry['logIndex'], 16)}"
+                deposit_id = f"{net.chain_id}:{entry['transactionHash'].lower()}:{int(entry['logIndex'], 16)}"
                 status = await record_deposit(
+                    net,
                     deposit_id,
                     entry["transactionHash"].lower(),
                     address_from_topic(entry["topics"][1]),
@@ -238,9 +396,7 @@ class DepositWatcher:
                 seen += status is not None
             async with SessionLocal() as session, session.begin():
                 cursor = (
-                    await session.execute(
-                        select(ChainCursor).where(ChainCursor.chain_id == settings.crypto_chain_id).with_for_update()
-                    )
+                    await session.execute(select(ChainCursor).where(ChainCursor.chain_id == net.chain_id).with_for_update())
                 ).scalar_one()
                 cursor.last_block = max(cursor.last_block, to)
             last = to
@@ -259,10 +415,11 @@ class LinkWalletIn(BaseModel):
 class CryptoWithdrawalIn(BaseModel):
     amount_usd: Decimal = Field(gt=0, decimal_places=2)
     to_address: str
+    network: str | None = Field(None, description="network key or chain id; default: cheapest configured network")
 
 
 def _link_message(agent_id: str, address: str, nonce: str) -> str:
-    return f"Aether wallet link\nagent: {agent_id}\naddress: {address}\nchain: {settings.crypto_chain_id}\nnonce: {nonce}"
+    return f"Aether wallet link\nagent: {agent_id}\naddress: {address}\nnetworks: all supported EVM networks\nnonce: {nonce}"
 
 
 def _nonce_key(agent_id: str, nonce: str) -> str:
@@ -271,30 +428,20 @@ def _nonce_key(agent_id: str, nonce: str) -> str:
 
 @router.get("/v1/billing/crypto")
 async def deposit_instructions(request: Request, ctx: AuthContext = Depends(authenticate)):
-    _chain(request)
+    rails = _rails(request)
     async with SessionLocal() as session:
         wallets = (
             (await session.execute(select(LinkedWallet.address).where(LinkedWallet.agent_id == ctx.agent_id))).scalars().all()
         )
-    return {
-        "chain": settings.crypto_chain_name,
-        "chain_id": settings.crypto_chain_id,
-        "token": settings.crypto_token_symbol,
-        "token_contract": settings.crypto_token_address,
-        "treasury_address": settings.crypto_treasury_address,
-        "confirmations": settings.crypto_confirmations,
+    return funding_instructions(rails) | {
         "linked_wallets": list(wallets),
-        "instructions": (
-            f"1) Link a wallet: GET /v1/billing/crypto/link-challenge?address=<yours>, sign the message with it, "
-            f"POST /v1/billing/crypto/wallets. 2) Send {settings.crypto_token_symbol} on {settings.crypto_chain_name} "
-            "from that wallet to treasury_address. Other tokens or chains are not credited."
-        ),
+        "note": "Only native USDC on the listed networks is credited. Other tokens, bridged USDC.e and other networks are not.",
     }
 
 
 @router.get("/v1/billing/crypto/link-challenge")
 async def link_challenge(address: str, request: Request, ctx: AuthContext = Depends(authenticate)):
-    _chain(request)
+    _rails(request)
     addr = norm_address(address)
     nonce = secrets.token_hex(16)
     await request.app.state.redis.set(_nonce_key(ctx.agent_id, nonce), addr, ex=600)
@@ -303,7 +450,7 @@ async def link_challenge(address: str, request: Request, ctx: AuthContext = Depe
 
 @router.post("/v1/billing/crypto/wallets", status_code=201)
 async def link_wallet(body: LinkWalletIn, request: Request, ctx: AuthContext = Depends(authenticate)):
-    _chain(request)
+    rails = _rails(request)
     addr = norm_address(body.address)
     expected = await request.app.state.redis.getdel(_nonce_key(ctx.agent_id, body.nonce))
     if expected != addr:
@@ -344,49 +491,60 @@ async def link_wallet(body: LinkWalletIn, request: Request, ctx: AuthContext = D
             if pending:
                 agents = await ledger.lock_agents(session, [ctx.agent_id])
                 for deposit in pending:
+                    network = rails.network(chain_of_deposit(deposit.id))
                     deposit.agent_id, deposit.status = ctx.agent_id, "credited"
-                    _credit(session, agents, deposit)
-                    credited += units_to_nanos(deposit.amount_units)
+                    _credit(session, agents, deposit, network)
+                    credited += _deposit_nanos(deposit, network)
     except IntegrityError:
         raise HTTPException(409, detail="address is linked to another agent") from None
     return {"address": addr, "linked": True, "credited_now_usd": fmt_usd(credited)}
 
 
 @router.get("/v1/billing/crypto/deposits")
-async def my_deposits(ctx: AuthContext = Depends(authenticate)):
+async def my_deposits(request: Request, ctx: AuthContext = Depends(authenticate)):
+    rails = getattr(request.app.state, "crypto", None)
     async with SessionLocal() as session:
         rows = (
             (
                 await session.execute(
-                    select(CryptoDeposit)
-                    .where(CryptoDeposit.agent_id == ctx.agent_id)
-                    .order_by(CryptoDeposit.block_number.desc())
+                    select(CryptoDeposit).where(CryptoDeposit.agent_id == ctx.agent_id).order_by(CryptoDeposit.created_at.desc())
                 )
             )
             .scalars()
             .all()
         )
-    return [
-        {"id": d.id, "tx_hash": d.tx_hash, "amount": fmt_token(d.amount_units), "block": d.block_number, "status": d.status}
-        for d in rows
-    ]
+    out = []
+    for d in rows:
+        network = rails.network(chain_of_deposit(d.id)) if rails else None
+        out.append(
+            {
+                "id": d.id,
+                "network": network.key if network else chain_of_deposit(d.id),
+                "tx_hash": d.tx_hash,
+                "amount": network.fmt(d.amount_units) if network else str(d.amount_units),
+                "block": d.block_number,
+                "status": d.status,
+            }
+        )
+    return out
 
 
 @router.post("/v1/billing/crypto/withdrawals", status_code=201)
 async def request_withdrawal(body: CryptoWithdrawalIn, request: Request, ctx: AuthContext = Depends(authenticate)):
     """Withdraw available balance to one of the agent's own linked wallets."""
-    _chain(request)
+    rail = _rails(request).pick(body.network)
+    net = rail.network
     if body.amount_usd < settings.crypto_min_withdrawal_usd:
         raise HTTPException(422, detail=f"minimum withdrawal is ${settings.crypto_min_withdrawal_usd}")
     to = norm_address(body.to_address)
-    units = int(body.amount_usd * 10**settings.crypto_token_decimals)
-    nanos = units_to_nanos(units)
+    units = int(body.amount_usd * 10**net.decimals)
+    nanos = net.to_nanos(units)
     async with SessionLocal() as session, session.begin():
         wallet = await session.get(LinkedWallet, to)
         if wallet is None or wallet.agent_id != ctx.agent_id:
             raise HTTPException(409, detail="payouts go only to a wallet this agent has linked")
         agents = await ledger.lock_agents(session, [ctx.agent_id])
-        payout = CryptoPayout(agent_id=ctx.agent_id, to_address=to, amount_units=units, status="pending")
+        payout = CryptoPayout(agent_id=ctx.agent_id, to_address=to, amount_units=units, status="pending", chain_id=net.chain_id)
         session.add(payout)
         await session.flush()
         try:
@@ -400,12 +558,13 @@ async def request_withdrawal(body: CryptoWithdrawalIn, request: Request, ctx: Au
             )
         except ledger.InsufficientFunds:
             raise HTTPException(402, detail="insufficient available balance") from None
-    log.info("PAYOUT requested %s agent=%s to=%s id=%s", fmt_token(units), ctx.agent_id, to, payout.id)
-    return {"payout_id": payout.id, "status": "pending", "amount": fmt_token(units), "to_address": to}
+    log.info("PAYOUT requested %s agent=%s to=%s id=%s", net.fmt(units), ctx.agent_id, to, payout.id)
+    return {"payout_id": payout.id, "status": "pending", "amount": net.fmt(units), "network": net.key, "to_address": to}
 
 
 @router.get("/v1/billing/crypto/withdrawals")
-async def my_withdrawals(ctx: AuthContext = Depends(authenticate)):
+async def my_withdrawals(request: Request, ctx: AuthContext = Depends(authenticate)):
+    rails = getattr(request.app.state, "crypto", None)
     async with SessionLocal() as session:
         rows = (
             (
@@ -416,15 +575,27 @@ async def my_withdrawals(ctx: AuthContext = Depends(authenticate)):
             .scalars()
             .all()
         )
-    return [_payout_out(p) for p in rows]
+    return [_payout_out(p, rails) for p in rows]
 
 
-def _payout_out(p: CryptoPayout) -> dict:
+def _payout_network(p: CryptoPayout, rails: "CryptoRails | None") -> Network | None:
+    if rails is None:
+        return None
+    if p.chain_id is None:  # created before multi-network support: the first configured network
+        return next(iter(rails.rails.values())).network
+    return rails.network(p.chain_id)
+
+
+def _payout_out(p: CryptoPayout, rails: "CryptoRails | None") -> dict:
+    net = _payout_network(p, rails)
     return {
         "payout_id": p.id,
         "agent_id": p.agent_id,
+        "network": net.key if net else p.chain_id,
+        "chain_id": net.chain_id if net else p.chain_id,
+        "token_contract": net.token_address if net else None,
         "to_address": p.to_address,
-        "amount": fmt_token(p.amount_units),
+        "amount": net.fmt(p.amount_units) if net else str(p.amount_units),
         "amount_units": p.amount_units,
         "status": p.status,
         "tx_hash": p.tx_hash,
@@ -441,35 +612,33 @@ class MarkPaidIn(BaseModel):
 
 
 @router.get("/v1/admin/crypto/payouts")
-async def admin_payouts(status: str = "pending", x_admin_token: str | None = Header(None)):
+async def admin_payouts(request: Request, status: str = "pending", x_admin_token: str | None = Header(None)):
     require_admin(x_admin_token)
+    rails = getattr(request.app.state, "crypto", None)
     async with SessionLocal() as session:
         rows = (
             (await session.execute(select(CryptoPayout).where(CryptoPayout.status == status).order_by(CryptoPayout.created_at)))
             .scalars()
             .all()
         )
-    return {
-        "token": settings.crypto_token_symbol,
-        "token_contract": settings.crypto_token_address,
-        "payouts": [_payout_out(p) for p in rows],
-    }
+    return {"payouts": [_payout_out(p, rails) for p in rows]}
 
 
-async def _verify_transfer(chain: EvmClient, tx_hash: str, to: str, units: int) -> None:
-    receipt = await chain.receipt(tx_hash)
+async def _verify_transfer(rail: Rail, tx_hash: str, to: str, units: int) -> None:
+    net, client = rail.network, rail.client
+    receipt = await client.receipt(tx_hash)
     if not receipt:
-        raise HTTPException(409, detail="transaction not found (not mined yet?)")
+        raise HTTPException(409, detail=f"transaction not found on {net.name} (not mined yet, or wrong network?)")
     if receipt.get("status") != "0x1":
         raise HTTPException(409, detail="transaction failed on-chain")
-    confirmations = await chain.block_number() - int(receipt["blockNumber"], 16) + 1
-    if confirmations < settings.crypto_confirmations:
-        raise HTTPException(409, detail=f"only {confirmations}/{settings.crypto_confirmations} confirmations; retry shortly")
-    treasury, token = settings.crypto_treasury_address.lower(), settings.crypto_token_address.lower()
+    confirmations = await client.block_number() - int(receipt["blockNumber"], 16) + 1
+    if confirmations < net.confirmations:
+        raise HTTPException(409, detail=f"only {confirmations}/{net.confirmations} confirmations; retry shortly")
+    treasury = settings.crypto_treasury_address.lower()
     for entry in receipt.get("logs", []):
         topics = entry.get("topics", [])
         if (
-            entry.get("address", "").lower() == token
+            entry.get("address", "").lower() == net.token_address
             and len(topics) == 3
             and topics[0] == TRANSFER_TOPIC
             and address_from_topic(topics[1]) == treasury
@@ -477,25 +646,25 @@ async def _verify_transfer(chain: EvmClient, tx_hash: str, to: str, units: int) 
             and int(entry["data"], 16) == units
         ):
             return
-    raise HTTPException(
-        409,
-        detail=f"no {settings.crypto_token_symbol} transfer of {fmt_token(units)} from the treasury to {to} in that transaction",
-    )
+    raise HTTPException(409, detail=f"no transfer of {net.fmt(units)} from the treasury to {to} in that transaction")
 
 
 @router.post("/v1/admin/crypto/payouts/{payout_id}/paid")
 async def admin_mark_paid(payout_id: str, body: MarkPaidIn, request: Request, x_admin_token: str | None = Header(None)):
     require_admin(x_admin_token)
-    chain = _chain(request)
+    rails = _rails(request)
     async with SessionLocal() as session:
         payout = await session.get(CryptoPayout, payout_id)
     if payout is None:
         raise HTTPException(404, detail="payout not found")
     if payout.status != "pending":
         raise HTTPException(409, detail=f"payout is already {payout.status}")
+    net = _payout_network(payout, rails)
+    if net is None:
+        raise HTTPException(409, detail=f"network {payout.chain_id} is not configured on this clearinghouse")
     tx_hash = body.tx_hash.lower()
-    await _verify_transfer(chain, tx_hash, payout.to_address, payout.amount_units)
-    nanos = units_to_nanos(payout.amount_units)
+    await _verify_transfer(rails.rails[net.chain_id], tx_hash, payout.to_address, payout.amount_units)
+    nanos = net.to_nanos(payout.amount_units)
     try:
         async with SessionLocal() as session, session.begin():
             payout = (
@@ -512,17 +681,18 @@ async def admin_mark_paid(payout_id: str, body: MarkPaidIn, request: Request, x_
                 kind="payout_sent",
                 ref_type="crypto_payout",
                 ref_id=payout_id,
-                memo=f"tx {tx_hash}",
+                memo=f"{net.key} tx {tx_hash}",
             )
     except IntegrityError:
         raise HTTPException(409, detail="that transaction is already recorded for another payout") from None
-    log.info("PAYOUT paid %s id=%s tx=%s", fmt_token(payout.amount_units), payout_id, tx_hash)
-    return _payout_out(payout)
+    log.info("PAYOUT paid %s id=%s tx=%s", net.fmt(payout.amount_units), payout_id, tx_hash)
+    return _payout_out(payout, rails)
 
 
 @router.post("/v1/admin/crypto/payouts/{payout_id}/cancel")
-async def admin_cancel(payout_id: str, x_admin_token: str | None = Header(None)):
+async def admin_cancel(payout_id: str, request: Request, x_admin_token: str | None = Header(None)):
     require_admin(x_admin_token)
+    rails = getattr(request.app.state, "crypto", None)
     async with SessionLocal() as session, session.begin():
         payout = (
             await session.execute(select(CryptoPayout).where(CryptoPayout.id == payout_id).with_for_update())
@@ -531,8 +701,10 @@ async def admin_cancel(payout_id: str, x_admin_token: str | None = Header(None))
             raise HTTPException(404, detail="payout not found")
         if payout.status != "pending":
             raise HTTPException(409, detail=f"payout is already {payout.status}")
+        net = _payout_network(payout, rails)
+        decimals = net.decimals if net else 6
+        nanos = payout.amount_units * (NANOS_PER_USD // 10**decimals)
         agents = await ledger.lock_agents(session, [payout.agent_id])
-        nanos = units_to_nanos(payout.amount_units)
         ledger.post(
             session,
             agents,
@@ -543,15 +715,26 @@ async def admin_cancel(payout_id: str, x_admin_token: str | None = Header(None))
             memo="cancelled by operator",
         )
         payout.status = "cancelled"
-    return _payout_out(payout)
+    return _payout_out(payout, rails)
 
 
 @router.get("/v1/admin/crypto/solvency")
 async def admin_solvency(request: Request, x_admin_token: str | None = Header(None)):
-    """Is the treasury's on-chain balance enough to cover every obligation?"""
+    """Is the treasury's on-chain balance (all networks) enough to cover every obligation?"""
     require_admin(x_admin_token)
-    chain = _chain(request)
-    onchain_units = await chain.token_balance(settings.crypto_token_address, settings.crypto_treasury_address)
+    rails = _rails(request)
+    treasury = settings.crypto_treasury_address
+    per_network, onchain, errors = [], 0, []
+    for rail in rails.rails.values():
+        net = rail.network
+        try:
+            units = await rail.client.token_balance(net.token_address, treasury)
+            is_contract = (await rail.client.code(treasury)) not in ("0x", "0x0")
+            per_network.append({"network": net.key, "balance": net.fmt(units), "treasury_is_contract": is_contract})
+            onchain += net.to_nanos(units)
+        except ChainError as exc:
+            errors.append(f"{net.key}: {exc}")
+            per_network.append({"network": net.key, "balance": None, "error": str(exc)})
     async with SessionLocal() as session:
         balances = (
             await session.execute(select(func.coalesce(func.sum(Agent.balance_available_nanos + Agent.balance_escrow_nanos), 0)))
@@ -570,36 +753,48 @@ async def admin_solvency(request: Request, x_admin_token: str | None = Header(No
             ).all()
         )
         unattributed = (
-            await session.execute(
-                select(func.coalesce(func.sum(CryptoDeposit.amount_units), 0)).where(CryptoDeposit.status == "unattributed")
-            )
+            await session.execute(select(func.count()).select_from(CryptoDeposit).where(CryptoDeposit.status == "unattributed"))
         ).scalar_one()
-    onchain = units_to_nanos(onchain_units)
     owed_agents = int(balances)
     payable = int(by_account.get(ledger.HOUSE_CRYPTO_PAYABLE, 0))
-    fees = int(by_account.get(ledger.HOUSE_FEES, 0))
     obligations = owed_agents + payable
     return {
-        "treasury_address": settings.crypto_treasury_address,
-        "onchain_balance": fmt_token(onchain_units),
+        "treasury_address": treasury,
+        "networks": per_network,
+        "onchain_total_usd": fmt_usd(onchain),
         "owed_to_agents_usd": fmt_usd(owed_agents),
         "pending_payouts_usd": fmt_usd(payable),
-        "fees_earned_usd": fmt_usd(fees),
-        "unattributed_deposits": fmt_token(int(unattributed)),
+        "fees_earned_usd": fmt_usd(int(by_account.get(ledger.HOUSE_FEES, 0))),
+        "unattributed_deposits": int(unattributed),
         "deposited_total_usd": fmt_usd(-int(by_account.get(ledger.HOUSE_CRYPTO_IN, 0))),
         "paid_out_total_usd": fmt_usd(int(by_account.get(ledger.HOUSE_CRYPTO_OUT, 0))),
         "surplus_usd": fmt_usd(onchain - obligations),
-        "solvent": onchain >= obligations,
+        "solvent": not errors and onchain >= obligations,
+        "errors": errors,
     }
 
 
 async def run_watcher_pass(app) -> None:
-    watcher = getattr(app.state, "deposit_watcher", None)
-    if watcher is not None:
+    rails: CryptoRails | None = getattr(app.state, "crypto", None)
+    if rails is None:
+        return
+    for rail in rails.rails.values():
         try:
-            await watcher.maybe_poll()
+            await rail.watcher.maybe_poll()
         except ChainError as exc:
-            log.warning("deposit watcher: %s", exc)
+            log.warning("deposit watcher %s: %s", rail.network.key, exc)
 
 
-__all__ = ["DepositWatcher", "EvmClient", "record_deposit", "router", "run_watcher_pass"]
+__all__ = [
+    "CryptoRails",
+    "DepositWatcher",
+    "EvmClient",
+    "Network",
+    "PRESETS",
+    "configured_networks",
+    "funding_instructions",
+    "record_deposit",
+    "require_admin",
+    "router",
+    "run_watcher_pass",
+]
