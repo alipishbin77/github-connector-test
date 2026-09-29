@@ -20,6 +20,16 @@ class UnsafeURL(ValueError):
     """A URL the server refuses to connect to."""
 
 
+class UnresolvableHost(UnsafeURL):
+    """A host that answers with no address at all.
+
+    Still an `UnsafeURL` — every existing caller keeps refusing it — but told
+    apart from "resolves to somewhere private", because the two mean different
+    things to a *reporting* caller: a domain that does not resolve is a finding
+    about that domain, while an address inside our own networks is an attack on
+    this host and must stay a refusal."""
+
+
 def ip_is_public(ip: IPAddress) -> bool:
     if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
         return False
@@ -32,7 +42,7 @@ async def resolve_public(host: str, port: int) -> list[str]:
     try:
         infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror:
-        raise UnsafeURL("host does not resolve") from None
+        raise UnresolvableHost("host does not resolve") from None
     addresses = []
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
@@ -40,7 +50,7 @@ async def resolve_public(host: str, port: int) -> list[str]:
             raise UnsafeURL(f"resolves to the non-public address {ip}")
         addresses.append(str(ip))
     if not addresses:
-        raise UnsafeURL("host does not resolve")
+        raise UnresolvableHost("host does not resolve")
     return addresses
 
 
