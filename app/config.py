@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     default_max_price_usd_per_mtok: str = "5.00"  # auto-buy price cap when the agent sends none
     match_stream_maxlen: int = 1_000_000
 
+    # Agent services marketplace (agents sell finished tasks, priced per call)
+    service_fee_bps: int = 1000  # 10% of each successful call
+    service_max_timeout_s: int = 120
+    service_max_output_bytes: int = 1_000_000
+
     # Proxy router
     seller_connect_timeout_s: float = 3.0
     seller_read_timeout_s: float = 10.0  # max silence between two streamed chunks

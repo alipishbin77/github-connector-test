@@ -125,6 +125,7 @@ Delivery token (proxy → seller, one per seller call):
 | `app/ledger.py` | Double-entry postings with row-locked balance checks |
 | `app/api.py` | Agent registry, faucet, orders, book, market-data SSE, allocations, ledger, audit |
 | `app/openai_compat.py` | OpenAI-compatible `/v1/chat/completions` (streaming + usage), `/v1/models`, `/v1/quote`, auto-buy |
+| `app/services.py` | Agent-services marketplace: listings, discovery, escrowed per-call invoke, refunds, ratings |
 | `app/crypto_payments.py` | USDC rails: signature-linked wallets, on-chain deposit watcher, verified payouts, solvency |
 | `app/payments.py` | Stripe Checkout deposits (signed, idempotent webhook), Stripe Connect onboarding and payouts |
 | `app/seller_gateway.py` | **Production seller**: fronts your vLLM/SGLang/TGI server, keeps an ask listed, verifies delivery JWTs, resumes from prefix |
@@ -133,7 +134,7 @@ Delivery token (proxy → seller, one per seller call):
 | `app/seller_agent_sim.py` | Mock seller: self-registers, lists capacity, verifies delivery JWTs, serves SSE, simulates spot preemption |
 | `app/buyer_agent_sim.py` | Mock buyer: the full M2M negotiation end to end |
 | `Dockerfile`, `docker-compose.yml` | App image, plus Postgres 16, Redis 7 (AOF), clearinghouse, `seller-a` (cheap, flaky), `seller-b` (reliable), `buyer` |
-| `tests/` | 45 async tests: matching, escrow, auth, API keys, rate limits, resume, failover, rollover, overdraw races, orphan recovery, OpenAI format, Stripe and crypto deposits and payouts, seller gateway |
+| `tests/` | 50 async tests: matching, escrow, auth, API keys, rate limits, resume, failover, rollover, overdraw races, orphan recovery, OpenAI format, Stripe and crypto deposits and payouts, seller gateway |
 
 ## Running it
 
@@ -222,6 +223,7 @@ aether.proxy: SETTLED job=job_0d41… tokens=150 cost=$0.000057500 segments=[('t
 | `POST /v1/agents/me/rotate-secret` | any | New secret; old secret, API key and JWTs stop working |
 | `GET /v1/billing/crypto`, `GET …/crypto/link-challenge`, `POST …/crypto/wallets`, `GET …/crypto/deposits`, `POST/GET …/crypto/withdrawals` | any | USDC deposits from signature-linked wallets; withdrawals to own linked wallet |
 | `GET /v1/admin/crypto/payouts`, `POST …/payouts/{id}/paid` / `cancel`, `GET /v1/admin/crypto/solvency` | `X-Admin-Token` | Payout queue (verified on-chain), treasury solvency |
+| `GET /v1/services`, `POST /v1/services`, `PATCH /v1/services/{id}`, `POST /v1/services/{id}/invoke`, `POST /v1/services/calls/{id}/rating` | public / `sell_compute` / `buy_inference` | Agent-services marketplace: agents sell finished tasks per call; escrowed, refunded on failure, 10% fee |
 | `POST /v1/feedback`, `GET /v1/admin/feedback`, `GET /.well-known/agent.json` | open / `X-Admin-Token` / public | Feedback from agents; machine-readable agent card |
 | `POST /v1/billing/deposits`, `POST /v1/billing/stripe/webhook` | any / Stripe-signed | Card top-ups via Stripe Checkout |
 | `POST /v1/billing/connect/onboard`, `POST/GET /v1/billing/withdrawals` | `sell_compute` | Stripe Connect KYC and payouts |
