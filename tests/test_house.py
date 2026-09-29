@@ -28,6 +28,7 @@ from fastapi import HTTPException
 from app import auth, netguard
 from app import house as app_house
 from app.config import settings
+from app.crypto_payments import PRESETS
 from app.readable import html_to_markdown
 
 from .helpers import new_agent
@@ -44,7 +45,7 @@ PRIVATE_HOSTS = [
     "192.168.1.1",
 ]
 
-SLUGS = ("webpage-to-markdown", "json-schema-validate", "usdc-balance", "domain-trust-audit")
+SLUGS = ("webpage-to-markdown", "json-schema-validate", "usdc-balance", "domain-trust-audit", "portfolio")
 PRICE_USD = {"domain-trust-audit": "0.10"}  # the audit is the one house service that is not a fraction of a cent
 
 
@@ -212,6 +213,145 @@ async def test_usdc_balance_rpc_failure_refunds_rather_than_crashing(client, hou
 
     assert r.status_code == 502
     assert r.json()["detail"]["error"] == "rpc_failed"
+
+
+# ------------------------------------------------------------------ portfolio
+
+
+def _rpc_result(payload: dict, *, native_wei: int, token_units: int) -> str:
+    if payload["method"] == "eth_getBalance":
+        return hex(native_wei)
+    assert payload["method"] == "eth_call"
+    return hex(token_units)
+
+
+async def test_portfolio_reads_native_and_token_balances(client, house, web):
+    address = "0x1454Ad4A90ce0c76b70b61004e0a50E6bA33e36A"
+    calls = []
+
+    def rpc(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        calls.append((request.url.host, payload["method"]))
+        result = _rpc_result(payload, native_wei=2 * 10**18, token_units=5_000_000)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": result})
+
+    web.responses["/"] = rpc
+
+    r = await invoke(client, house, "portfolio", {"address": address, "networks": ["base", "arbitrum"]})
+
+    assert r.status_code == 200, r.text
+    out = r.json()["output"]
+    assert out["address"] == address.lower()
+    assert {c["network"] for c in out["chains"]} == {"base", "arbitrum"}
+
+    base_chain = next(c for c in out["chains"] if c["network"] == "base")
+    assert base_chain["status"] == "ok"
+    assert base_chain["chain_id"] == 8453
+    assert base_chain["native"] == {
+        "symbol": "ETH",
+        "status": "ok",
+        "decimals": 18,
+        "balance": "2",
+        "balance_units": 2 * 10**18,
+    }
+    assert {t["symbol"] for t in base_chain["tokens"]} == {"USDC", "WETH"}
+    for token in base_chain["tokens"]:
+        assert token["status"] == "ok"
+        assert token["balance_units"] == 5_000_000
+
+    hosts = {host for host, _ in calls}
+    assert hosts == {"base-rpc.publicnode.com", "arbitrum-one-rpc.publicnode.com"}
+    # native + USDC + WETH per network, exactly the capped allowlist, no more.
+    assert len(calls) == 2 * (1 + len(app_house.TOKEN_ALLOWLIST["base"]))
+
+
+async def test_portfolio_defaults_to_every_configured_network(client, house, web):
+    def rpc(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": "0x0"})
+
+    web.responses["/"] = rpc
+
+    r = await invoke(client, house, "portfolio", {"address": "0x" + "11" * 20})
+
+    assert r.status_code == 200, r.text
+    out = r.json()["output"]
+    assert {c["network"] for c in out["chains"]} == set(PRESETS)
+
+
+async def test_portfolio_reports_per_asset_failure_without_5xx(client, house, web):
+    """One chain's dead RPC must not cost the buyer the rest of the portfolio."""
+
+    def rpc(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "arbitrum-one-rpc.publicnode.com":
+            return httpx.Response(500, text="rpc down")
+        payload = json.loads(request.content)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": "0x0"})
+
+    web.responses["/"] = rpc
+
+    r = await invoke(client, house, "portfolio", {"address": "0x" + "22" * 20, "networks": ["base", "arbitrum"]})
+
+    assert r.status_code == 200, r.text
+    out = r.json()["output"]
+    base_chain = next(c for c in out["chains"] if c["network"] == "base")
+    arb_chain = next(c for c in out["chains"] if c["network"] == "arbitrum")
+    assert base_chain["status"] == "ok"
+    assert base_chain["native"]["status"] == "ok"
+    # the chain answered, so its status is "ok"; the broken RPC shows up per asset.
+    assert arb_chain["status"] == "ok"
+    assert arb_chain["native"]["status"] == "error"
+    assert all(t["status"] == "error" for t in arb_chain["tokens"])
+
+
+async def test_portfolio_unknown_network_is_refused_before_any_rpc_call(client, house, web):
+    r = await invoke(client, house, "portfolio", {"address": "0x" + "33" * 20, "networks": ["dogecoin"]})
+
+    assert r.status_code == 422
+    assert r.json()["detail"]["error"] == "unknown_network"
+    assert web.requested == []
+
+
+async def test_portfolio_caches_identical_calls_for_30s(client, house, web):
+    address = "0x" + "44" * 20
+    hits = []
+
+    def rpc(request: httpx.Request) -> httpx.Response:
+        hits.append(1)
+        payload = json.loads(request.content)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": "0x0"})
+
+    web.responses["/"] = rpc
+
+    r1 = await invoke(client, house, "portfolio", {"address": address, "networks": ["base"]}, call_id="portfolio-c1")
+    assert r1.status_code == 200, r1.text
+    first_hits = len(hits)
+    assert first_hits > 0
+
+    r2 = await invoke(client, house, "portfolio", {"address": address, "networks": ["base"]}, call_id="portfolio-c2")
+    assert r2.status_code == 200, r2.text
+    assert len(hits) == first_hits  # served from the 30s cache, no new RPC calls
+    assert r2.json()["output"] == r1.json()["output"]
+
+
+async def test_portfolio_cache_key_is_independent_of_network_order(client, house, web):
+    address = "0x" + "55" * 20
+    hits = []
+
+    def rpc(request: httpx.Request) -> httpx.Response:
+        hits.append(1)
+        payload = json.loads(request.content)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": "0x0"})
+
+    web.responses["/"] = rpc
+
+    r1 = await invoke(client, house, "portfolio", {"address": address, "networks": ["base", "arbitrum"]}, call_id="order-c1")
+    assert r1.status_code == 200, r1.text
+    first_hits = len(hits)
+
+    r2 = await invoke(client, house, "portfolio", {"address": address, "networks": ["arbitrum", "base"]}, call_id="order-c2")
+    assert r2.status_code == 200, r2.text
+    assert len(hits) == first_hits
 
 
 # --------------------------------------------------------------------- auth
@@ -437,6 +577,10 @@ async def test_plain_text_pages_pass_through(client, house, web):
         ("usdc-balance", {"address": "nope", "network": "base"}),
         ("usdc-balance", {"address": "0x" + "ab" * 20, "network": "dogecoin"}),
         ("usdc-balance", None),
+        ("portfolio", {"address": "nope"}),
+        ("portfolio", {"address": "0x" + "ab" * 20, "networks": ["dogecoin"]}),
+        ("portfolio", {"address": "0x" + "ab" * 20, "networks": []}),
+        ("portfolio", None),
     ],
 )
 async def test_bad_input_is_a_clean_error_not_a_stack_trace(client, house, web, slug, payload):
