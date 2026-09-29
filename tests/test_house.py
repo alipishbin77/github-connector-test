@@ -483,13 +483,19 @@ def test_html_to_markdown_falls_back_when_main_is_empty():
 
 # ------------------------------------------------------------------- listing
 
+OWN_CGNAT = "100.98.111.112"  # what this host's own Funnel name resolves to locally
+
 
 @pytest.fixture
 def strict_urls(monkeypatch):
     """Production settings: the SSRF guard on, and a public URL that this host
-    resolves to a CGNAT address (which is what Tailscale actually answers)."""
+    resolves to a non-public address, which is what Tailscale answers for a
+    Funnel name asked from inside the tailnet. A literal CGNAT address stands
+    in for that name: a real `*.ts.net` name resolves to a *public* Funnel
+    ingress from anywhere else, so asserting on it would pass here and fail on
+    a CI runner."""
     monkeypatch.setattr(settings, "allow_private_seller_urls", False)
-    monkeypatch.setattr(settings, "public_base_url", "https://appp.tail1cb552.ts.net")
+    monkeypatch.setattr(settings, "public_base_url", f"https://{OWN_CGNAT}")
 
 
 async def test_house_endpoints_can_be_listed_behind_the_ssrf_guard(client, strict_urls):
@@ -504,18 +510,18 @@ async def test_house_endpoints_can_be_listed_behind_the_ssrf_guard(client, stric
     own = await client.post(
         "/v1/services",
         headers=seller["headers"],
-        json=listing | {"endpoint_url": "https://appp.tail1cb552.ts.net/v1/house/webpage-to-markdown"},
+        json=listing | {"endpoint_url": f"https://{OWN_CGNAT}/v1/house/webpage-to-markdown"},
     )
     other_path = await client.post(
-        "/v1/services", headers=seller["headers"], json=listing | {"endpoint_url": "https://appp.tail1cb552.ts.net/v1/admin"}
+        "/v1/services", headers=seller["headers"], json=listing | {"endpoint_url": f"https://{OWN_CGNAT}/v1/admin"}
     )
     other_origin = await client.post(
         "/v1/services",
         headers=seller["headers"],
-        json=listing | {"endpoint_url": "https://evil.test/v1/house/webpage-to-markdown"},
+        json=listing | {"endpoint_url": "https://10.0.0.5/v1/house/webpage-to-markdown"},
     )
 
     assert own.status_code == 201, own.text
     # The exemption is one origin and one path prefix: nothing else gets it.
-    assert other_path.status_code == 422
-    assert other_origin.status_code == 422
+    assert other_path.status_code == 422, other_path.text
+    assert other_origin.status_code == 422, other_origin.text
