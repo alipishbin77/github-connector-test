@@ -153,7 +153,7 @@ async def get_service(service_id: str):
 async def create_service(body: ServiceIn, ctx: AuthContext = Depends(require_scopes(SCOPE_SELL))):
     from .api import _validate_endpoint  # local import: api imports this module's siblings
 
-    await _validate_endpoint(body.endpoint_url)
+    await _validate_endpoint(body.endpoint_url, ctx.agent_id)
     service = Service(
         seller_id=ctx.agent_id,
         name=body.name,
@@ -182,7 +182,7 @@ async def update_service(service_id: str, body: ServicePatch, ctx: AuthContext =
     from .api import _validate_endpoint
 
     if body.endpoint_url:
-        await _validate_endpoint(body.endpoint_url)
+        await _validate_endpoint(body.endpoint_url, ctx.agent_id)
     async with SessionLocal() as session, session.begin():
         service = await session.get(Service, service_id)
         if service is None or service.seller_id != ctx.agent_id:

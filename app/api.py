@@ -2,8 +2,6 @@
 
 import asyncio
 import hmac
-import ipaddress
-import socket
 import time
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -16,7 +14,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import ledger
+from . import house, ledger, netguard
 from .auth import (
     ALL_SCOPES,
     SCOPE_BUY,
@@ -286,22 +284,33 @@ async def me(ctx: AuthContext = Depends(authenticate), session: AsyncSession = D
     return agent_out(await session.get(Agent, ctx.agent_id))
 
 
-async def _validate_endpoint(url: str) -> None:
+def _is_own_house_endpoint(url: str, agent_id: str | None) -> bool:
+    """One exemption from the address rules: the platform's own house services
+    (app/house.py) are listed like any other seller, but their endpoint is this
+    process' public URL — which the clearinghouse's own resolver answers with a
+    private or CGNAT address. The origin comes from operator config, never from
+    an agent, and only the house paths qualify.
+
+    The exemption is also restricted to the configured house agent. Without that
+    any seller could list our own house endpoint as their service and collect the
+    price for work this server performs at its own cost — and turn the fetcher
+    into an open web proxy attributable to this host, paid for by someone else."""
+    if not settings.house_agent_id or agent_id != settings.house_agent_id:
+        return False
+    own, given = urlparse(settings.public_base_url), urlparse(url)
+    return (own.scheme, own.netloc) == (given.scheme, given.netloc) and given.path.startswith(house.HOUSE_PREFIX + "/")
+
+
+async def _validate_endpoint(url: str, agent_id: str | None = None) -> None:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise HTTPException(422, detail="endpoint_url must be an absolute http(s) URL")
-    if settings.allow_private_seller_urls:
+    if settings.allow_private_seller_urls or _is_own_house_endpoint(url, agent_id):
         return
-    if parsed.scheme != "https":
-        raise HTTPException(422, detail="endpoint_url must use https")
     try:
-        infos = await asyncio.get_running_loop().getaddrinfo(parsed.hostname, parsed.port or 443)
-    except socket.gaierror:
-        raise HTTPException(422, detail="endpoint_url host does not resolve") from None
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-            raise HTTPException(422, detail="endpoint_url resolves to a non-public address")
+        await netguard.check_public_url(url)
+    except netguard.UnsafeURL as exc:
+        raise HTTPException(422, detail=f"endpoint_url {exc}") from None
 
 
 @router.put("/agents/me/endpoint", response_model=AgentOut, tags=["agents"])
@@ -312,7 +321,7 @@ async def set_endpoint(
 ):
     """Register the seller's stateless inference webhook. The clearinghouse is
     the only caller; each call carries a single-use delivery JWT."""
-    await _validate_endpoint(body.endpoint_url)
+    await _validate_endpoint(body.endpoint_url, ctx.agent_id)
     agent = await session.get(Agent, ctx.agent_id)
     agent.endpoint_url = body.endpoint_url
     await session.commit()
