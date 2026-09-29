@@ -30,6 +30,7 @@ from .auth import (
     require_scopes,
 )
 from .config import settings
+from .crypto_payments import funding_instructions
 from .db import SessionLocal, get_session, utcnow
 from .exchange import ExchangeError, cancel_order, place_order, release_trade
 from .models import (
@@ -42,6 +43,7 @@ from .models import (
     ORDER_OPEN,
     TRADE_ACTIVE,
     Agent,
+    Feedback,
     InferenceJob,
     Order,
     Trade,
@@ -55,7 +57,10 @@ INSTRUMENT_PATTERN = r"^[a-z0-9][a-z0-9._:-]{1,63}$"
 
 
 def _raise(exc: ExchangeError):
-    raise HTTPException(exc.status_code, detail={"error": "rejected", "error_description": exc.message})
+    detail = {"error": "rejected", "error_description": exc.message}
+    if exc.status_code == 402 and (how := funding_instructions()):
+        detail["how_to_fund"] = how  # machine-actionable: exactly how to pay
+    raise HTTPException(exc.status_code, detail=detail)
 
 
 # ------------------------------------------------------------------- schemas
@@ -509,6 +514,9 @@ async def admin_stats(session: AsyncSession = Depends(get_session), x_admin_toke
         "agents": agents,
         "sellers_with_endpoint": sellers,
         "jobs_24h": jobs,
+        "feedback_24h": (
+            await session.execute(select(func.count()).select_from(Feedback).where(Feedback.created_at >= since))
+        ).scalar_one(),
     }
 
 

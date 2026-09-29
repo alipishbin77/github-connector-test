@@ -11,7 +11,8 @@ from app.config import settings
 from .helpers import audit_ok, me, new_agent
 
 TREASURY = "0x" + "7e" * 20
-TOKEN = settings.crypto_token_address.lower()
+TOKEN = "0x" + "a0" * 20
+TOKEN_B = "0x" + "b0" * 20
 ADMIN = "test-admin-token-0123456789abcdef"
 
 
@@ -20,9 +21,10 @@ def topic(addr: str) -> str:
 
 
 class FakeChain:
-    """In-memory EVM JSON-RPC node: blocks, Transfer logs, receipts, balanceOf."""
+    """In-memory EVM JSON-RPC node: blocks, Transfer logs, receipts, balanceOf, getCode."""
 
-    def __init__(self):
+    def __init__(self, token: str = TOKEN):
+        self.token = token
         self.head = 1_000
         self.logs: list[dict] = []
         self.receipts: dict[str, dict] = {}
@@ -31,7 +33,7 @@ class FakeChain:
     def transfer_in(self, sender: str, units: int, block: int, tx: str, index: int = 0) -> None:
         self.logs.append(
             {
-                "address": TOKEN,
+                "address": self.token,
                 "topics": [cp.TRANSFER_TOPIC, topic(sender), topic(TREASURY)],
                 "data": hex(units),
                 "blockNumber": hex(block),
@@ -46,7 +48,7 @@ class FakeChain:
         self.receipts[tx] = {
             "status": status,
             "blockNumber": hex(block),
-            "logs": [{"address": TOKEN, "topics": [cp.TRANSFER_TOPIC, topic(TREASURY), topic(to)], "data": hex(units)}],
+            "logs": [{"address": self.token, "topics": [cp.TRANSFER_TOPIC, topic(TREASURY), topic(to)], "data": hex(units)}],
         }
         self.balance_units -= units
 
@@ -65,25 +67,35 @@ class FakeChain:
             result = self.receipts.get(params[0])
         elif method == "eth_call":
             result = hex(self.balance_units)
+        elif method == "eth_getCode":
+            result = "0x"
         else:
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "error": {"message": "unsupported"}})
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": result})
 
 
+_next_chain_id = iter(range(900_000, 999_999, 2))
+
+
 @pytest.fixture
 async def chain(app, monkeypatch):
-    fake = FakeChain()
+    """Two networks sharing one treasury: `chain` (default for payouts) and `chain.other`."""
+    cid = next(_next_chain_id)  # fresh chain ids => fresh deposit cursors per test
+    fake_a, fake_b = FakeChain(TOKEN), FakeChain(TOKEN_B)
+    net_a = cp.Network("net-a", "Net A", cid, "http://rpc-a.test", TOKEN, confirmations=5)
+    net_b = cp.Network("net-b", "Net B", cid + 1, "http://rpc-b.test", TOKEN_B, confirmations=5)
     monkeypatch.setattr(settings, "crypto_treasury_address", TREASURY)
-    monkeypatch.setattr(settings, "crypto_confirmations", 5)
     monkeypatch.setattr(settings, "admin_token", ADMIN)
-    monkeypatch.setattr(settings, "crypto_chain_id", 900_000 + len(fake.logs) + id(fake) % 99_999)  # own cursor per test
-    client = cp.EvmClient(httpx.AsyncClient(transport=httpx.MockTransport(fake.handle)), "http://rpc.test")
-    monkeypatch.setattr(app.state, "chain", client, raising=False)
-    watcher = cp.DepositWatcher(client)
-    monkeypatch.setattr(app.state, "deposit_watcher", watcher, raising=False)
-    fake.watcher = watcher
-    yield fake
-    await client.aclose()
+    rails = {}
+    for net, fake in ((net_a, fake_a), (net_b, fake_b)):
+        client = cp.EvmClient(httpx.AsyncClient(transport=httpx.MockTransport(fake.handle)), net.rpc_url)
+        fake.watcher = cp.DepositWatcher(net, client)
+        rails[net.chain_id] = cp.Rail(net, client, fake.watcher)
+    monkeypatch.setattr(app.state, "crypto", cp.CryptoRails(rails), raising=False)
+    fake_a.other = fake_b
+    yield fake_a
+    for rail in rails.values():
+        await rail.client.aclose()
 
 
 async def link(client, agent, account) -> httpx.Response:
@@ -108,6 +120,7 @@ async def test_linked_deposit_is_credited_once_after_confirmations(client, chain
     assert (await link(client, agent, wallet)).status_code == 201
     info = (await client.get("/v1/billing/crypto", headers=agent["headers"])).json()
     assert info["treasury_address"] == TREASURY and info["linked_wallets"] == [wallet.address.lower()]
+    assert [n["network"] for n in info["networks"]] == ["net-a", "net-b"]
 
     await chain.watcher.poll()  # initialise the cursor at the current safe head
     chain.transfer_in(wallet.address, 25_000_000, block=chain.head + 1, tx=tx(1))  # 25 USDC
@@ -119,7 +132,7 @@ async def test_linked_deposit_is_credited_once_after_confirmations(client, chain
     await chain.watcher.poll()  # re-scan / replay must not double-credit
     assert (await me(client, agent))["available_nanos"] == 25 * 10**9
     deposits = (await client.get("/v1/billing/crypto/deposits", headers=agent["headers"])).json()
-    assert [d["status"] for d in deposits] == ["credited"] and deposits[0]["amount"] == "25 USDC"
+    assert [d["status"] for d in deposits] == ["credited"] and deposits[0]["amount"] == "25 USDC on Net A"
     await audit_ok(client)
 
 
@@ -221,6 +234,73 @@ async def test_cancelled_payout_refunds_the_agent(client, chain):
 
 
 async def test_crypto_disabled_without_treasury(app, client, monkeypatch):
-    monkeypatch.setattr(app.state, "chain", None, raising=False)
+    monkeypatch.setattr(app.state, "crypto", None, raising=False)
     agent = await new_agent(client, "x", ["buy_inference"])
     assert (await client.get("/v1/billing/crypto", headers=agent["headers"])).status_code == 503
+
+
+async def test_deposits_and_payouts_on_a_second_network(client, chain):
+    agent = await new_agent(client, "multi", ["sell_compute"])
+    wallet = Account.create()
+    await link(client, agent, wallet)
+    other = chain.other
+    await other.watcher.poll()
+    other.transfer_in(wallet.address, 30_000_000, block=other.head + 1, tx=tx(20))
+    other.head += 20
+    await other.watcher.poll()
+    assert (await me(client, agent))["available_nanos"] == 30 * 10**9
+
+    r = await client.post(
+        "/v1/billing/crypto/withdrawals",
+        headers=agent["headers"],
+        json={"amount_usd": "12.00", "to_address": wallet.address, "network": "net-b"},
+    )
+    payout = r.json()
+    assert r.status_code == 201 and payout["network"] == "net-b"
+    bad = await client.post(
+        "/v1/billing/crypto/withdrawals",
+        headers=agent["headers"],
+        json={"amount_usd": "12.00", "to_address": wallet.address, "network": "dogechain"},
+    )
+    assert bad.status_code == 422
+
+    admin = {"X-Admin-Token": ADMIN}
+    url = f"/v1/admin/crypto/payouts/{payout['payout_id']}/paid"
+    chain.transfer_out(wallet.address, 12_000_000, block=chain.head, tx=tx(21))  # sent on the WRONG network
+    chain.head += 20
+    r = await client.post(url, headers=admin, json={"tx_hash": tx(21)})
+    assert r.status_code == 409 and "not found on Net B" in r.json()["detail"]
+    other.transfer_out(wallet.address, 12_000_000, block=other.head, tx=tx(22))
+    other.head += 20
+    assert (await client.post(url, headers=admin, json={"tx_hash": tx(22)})).json()["status"] == "paid"
+
+    solvency = (await client.get("/v1/admin/crypto/solvency", headers=admin)).json()
+    assert [n["network"] for n in solvency["networks"]] == ["net-a", "net-b"]
+    assert solvency["networks"][1]["balance"] == "18 USDC on Net B"
+    await audit_ok(client)
+
+
+async def test_insufficient_funds_errors_tell_machines_how_to_pay(client, chain, monkeypatch):
+    monkeypatch.setattr(settings, "crypto_networks", "base,arbitrum")
+    agent = await new_agent(client, "broke", ["buy_inference"])
+    r = await client.post(
+        "/v1/orders",
+        headers=agent["headers"],
+        json={"instrument": "llama-x", "side": "bid", "price_usd_per_mtok": "1.00", "quantity_tokens": 1000},
+    )
+    assert r.status_code == 402
+    how = r.json()["detail"]["how_to_fund"]
+    assert how["treasury_address"] == TREASURY and [n["network"] for n in how["networks"]] == ["base", "arbitrum"]
+
+
+def test_network_presets_and_json_config(monkeypatch):
+    monkeypatch.setattr(settings, "crypto_treasury_address", TREASURY)
+    monkeypatch.setattr(settings, "crypto_networks", "ethereum, base,polygon")
+    assert [n.chain_id for n in cp.configured_networks()] == [1, 8453, 137]
+    monkeypatch.setattr(settings, "crypto_networks", '[{"preset": "base", "rpc_url": "https://my-rpc.example"}]')
+    (net,) = cp.configured_networks()
+    assert net.chain_id == 8453 and net.rpc_url == "https://my-rpc.example"
+    monkeypatch.setattr(settings, "crypto_networks", None)
+    monkeypatch.setattr(settings, "crypto_chain_name", "Ethereum")
+    monkeypatch.setattr(settings, "crypto_chain_id", 1)
+    assert [n.key for n in cp.configured_networks()] == ["ethereum"]  # legacy single-network settings
