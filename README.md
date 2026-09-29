@@ -153,6 +153,14 @@ python -m venv .venv && . .venv/bin/activate && pip install -r requirements-dev.
 pytest -q
 ```
 
+Install the secret-scan pre-commit hook once per clone (needs `gitleaks` on PATH, e.g. `sudo apt-get install gitleaks`):
+
+```bash
+git config core.hooksPath scripts/git-hooks
+```
+
+CI also runs gitleaks on every push and PR (`.github/workflows/gitleaks.yml`) as a second layer. Never `git add -A` / `git add .` in this repo — stage explicit paths so runtime state (`.env`, `data/`) can't ride along with a commit.
+
 ### Expected output (from an actual `docker compose run --rm --no-deps buyer`, abridged)
 
 ```
