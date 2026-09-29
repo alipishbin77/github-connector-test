@@ -8,15 +8,19 @@ from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from .config import settings
+from .crypto_payments import configured_networks
 
 router = APIRouter(include_in_schema=False)
 
 
 def _payments_text() -> str:
-    if settings.crypto_treasury_address:
+    networks = configured_networks()
+    if networks:
+        symbols = sorted({n.token_symbol for n in networks})
+        names = ", ".join(n.name for n in networks)
         return (
-            f"{settings.crypto_token_symbol} on {settings.crypto_chain_name} (chain id {settings.crypto_chain_id}) "
-            f"to the treasury {settings.crypto_treasury_address}, sent from a wallet you have linked"
+            f"{'/'.join(symbols)} on {names} to the treasury {settings.crypto_treasury_address} "
+            "(same address on every network), sent from a wallet you have linked"
         )
     if settings.stripe_secret_key:
         return "card top-ups via Stripe Checkout (POST /v1/billing/deposits)"
@@ -42,7 +46,8 @@ Base URL: {base}/v1
    - Link your wallet: GET {base}/v1/billing/crypto/link-challenge?address=<0x...>
      sign the returned "message" with that wallet (EIP-191 personal_sign), then
      POST {base}/v1/billing/crypto/wallets {{"address": ..., "nonce": ..., "signature": ...}}
-   - Send the token from that wallet. It is credited after {confirmations} confirmations.
+   - Send native USDC from that wallet on any listed network (cheapest: Base, Arbitrum, OP Mainnet, Polygon).
+     It is credited after that network's confirmations. Bridged USDC.e and other tokens are not credited.
    - Check: GET {base}/v1/agents/me  (Authorization: Bearer <api_key>)
 3. Call any OpenAI-style client with base_url={base}/v1 and api_key=<api_key>:
    POST {base}/v1/chat/completions {{"model": "<instrument>", "messages": [...], "max_tokens": 256,
@@ -54,8 +59,13 @@ Register with scope "sell_compute", then run app/seller_gateway.py next to your 
 It keeps your capacity on the order book and gets paid per delivered token (minus a {fee} clearing fee).
 Withdraw: POST {base}/v1/billing/crypto/withdrawals {{"amount_usd": "25.00", "to_address": "<your linked wallet>"}}
 
+## Feedback (please!)
+Anything broken, missing or confusing: POST {base}/v1/feedback {{"category": "bug|feature|pricing|docs|other", "message": "..."}}
+No account needed. Include your api_key as Bearer to link it to your agent.
+
 ## Reference
-OpenAPI: {base}/openapi.json   Interactive docs: {base}/docs
+Agent card: {base}/.well-known/agent.json   OpenAPI: {base}/openapi.json   Interactive docs: {base}/docs
+Every 402 error includes "how_to_fund" with the exact payment steps.
 """
 
 
@@ -64,7 +74,6 @@ async def llms_txt():
     return LLMS_TXT.format(
         base=settings.public_base_url.rstrip("/"),
         payments=_payments_text(),
-        confirmations=settings.crypto_confirmations,
         fee=_fee_pct(),
     )
 
@@ -110,6 +119,11 @@ client.chat.completions.create(model="&lt;model&gt;", max_tokens=256,
     messages=[{{"role":"user","content":"hello"}}],
     extra_body={{"max_price_usd_per_mtok":"0.60"}})</code></pre>
 <p><b>Paying:</b> {payments}. Full steps for agents are in <a href="/llms.txt">/llms.txt</a>; every endpoint is in <a href="/docs">/docs</a>.</p>
+
+<h2>For machines</h2>
+<p>Discovery: <a href="/.well-known/agent.json">/.well-known/agent.json</a> · <a href="/llms.txt">/llms.txt</a> · <a href="/openapi.json">/openapi.json</a>.
+Every <code>402</code> response carries <code>how_to_fund</code> with exact payment steps. Tell us what to fix:
+<code>POST /v1/feedback</code> (no account needed).</p>
 
 <h2>For GPU owners</h2>
 <p>Run the seller gateway next to your own vLLM, SGLang or TGI server. It lists your capacity on the order book and you are paid

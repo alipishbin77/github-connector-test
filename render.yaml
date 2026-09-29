@@ -37,8 +37,8 @@ services:
         sync: false             # whsec_... for <public url>/v1/billing/stripe/webhook
       - key: AETHER_CRYPTO_TREASURY_ADDRESS
         sync: false             # public 0x address agents pay into (USDC on Base by default); never a private key
-      - key: AETHER_CRYPTO_RPC_URL
-        value: https://mainnet.base.org   # use a dedicated RPC (Alchemy/QuickNode/…) for production volume
+      - key: AETHER_CRYPTO_NETWORKS
+        value: ethereum,base,arbitrum,optimism,polygon   # native USDC on each; same treasury address everywhere
       - key: AETHER_CORS_ORIGINS
         value: '[]'
 

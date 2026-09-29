@@ -272,7 +272,22 @@ class CryptoPayout(Base):
     agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
     to_address: Mapped[str] = mapped_column(String(42))
     amount_units: Mapped[int] = mapped_column(BigInteger)
+    chain_id: Mapped[int | None] = mapped_column(Integer)  # network to pay on (NULL: pre multi-network payout)
     status: Mapped[str] = mapped_column(String(16), index=True)  # pending | paid | cancelled
     tx_hash: Mapped[str | None] = mapped_column(String(66), unique=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Feedback(Base):
+    """Feedback from agents and people (POST /v1/feedback)."""
+
+    __tablename__ = "feedback"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    agent_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    category: Mapped[str] = mapped_column(String(16))
+    message: Mapped[str] = mapped_column(Text)
+    contact: Mapped[str | None] = mapped_column(String(200))
+    user_agent: Mapped[str | None] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
