@@ -46,6 +46,8 @@ from .models import (
     Feedback,
     InferenceJob,
     Order,
+    Service,
+    ServiceCall,
     Trade,
     TradeLedger,
 )
@@ -514,6 +516,12 @@ async def admin_stats(session: AsyncSession = Depends(get_session), x_admin_toke
         "agents": agents,
         "sellers_with_endpoint": sellers,
         "jobs_24h": jobs,
+        "services_active": (
+            await session.execute(select(func.count()).select_from(Service).where(Service.status == "active"))
+        ).scalar_one(),
+        "service_calls": dict(
+            (await session.execute(select(ServiceCall.status, func.count()).group_by(ServiceCall.status))).all()
+        ),
         "feedback_24h": (
             await session.execute(select(func.count()).select_from(Feedback).where(Feedback.created_at >= since))
         ).scalar_one(),
@@ -556,7 +564,14 @@ async def audit(session: AsyncSession = Depends(get_session), x_admin_token: str
         trade_escrow = (
             await session.execute(select(func.coalesce(func.sum(Trade.escrow_nanos), 0)).where(Trade.buyer_id == a.id))
         ).scalar_one()
-        if order_escrow + trade_escrow != a.balance_escrow_nanos:
+        call_escrow = (
+            await session.execute(
+                select(func.coalesce(func.sum(ServiceCall.price_nanos), 0)).where(
+                    ServiceCall.buyer_id == a.id, ServiceCall.status == "pending"
+                )
+            )
+        ).scalar_one()
+        if order_escrow + trade_escrow + call_escrow != a.balance_escrow_nanos:
             escrow_mismatches.append(a.id)
     open_asks = (
         await session.execute(select(func.count()).select_from(Order).where(Order.side == ASK, Order.status == ORDER_OPEN))

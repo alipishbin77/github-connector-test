@@ -223,6 +223,27 @@ def issue_delivery_token(
     return jwt.encode(claims, key.private_key, algorithm=ALGORITHM, headers={"kid": key.kid})
 
 
+def issue_service_token(*, seller_id: str, call_id: str, service_id: str, price_nanos: int, body_sha256: str) -> str:
+    """Single-use capability for one agent-service call, bound to the exact
+    request body; sellers verify it offline against the JWKS."""
+    now = int(time.time())
+    claims = {
+        "iss": settings.jwt_issuer,
+        "sub": call_id,
+        "aud": delivery_audience(seller_id),
+        "iat": now,
+        "nbf": now,
+        "exp": now + settings.delivery_token_ttl_s,
+        "jti": uuid.uuid4().hex,
+        "typ": "service_call",
+        "service_id": service_id,
+        "price_nanos": price_nanos,
+        "body_sha256": body_sha256,
+    }
+    key = signing_key()
+    return jwt.encode(claims, key.private_key, algorithm=ALGORITHM, headers={"kid": key.kid})
+
+
 def _unauthorized(error: str, description: str) -> HTTPException:
     return HTTPException(
         status.HTTP_401_UNAUTHORIZED,

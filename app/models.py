@@ -291,3 +291,51 @@ class Feedback(Base):
     contact: Mapped[str | None] = mapped_column(String(200))
     user_agent: Mapped[str | None] = mapped_column(String(200))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class Service(Base):
+    """A task an agent sells, priced per call (e.g. "summarize a URL")."""
+
+    __tablename__ = "services"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("svc"))
+    seller_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    name: Mapped[str] = mapped_column(String(80))
+    description: Mapped[str] = mapped_column(Text)
+    category: Mapped[str] = mapped_column(String(32), index=True)
+    tags: Mapped[str] = mapped_column(String(256), default="")
+    input_schema: Mapped[str | None] = mapped_column(Text)  # JSON Schema, informative
+    example_input: Mapped[str | None] = mapped_column(Text)  # JSON
+    price_nanos: Mapped[int] = mapped_column(BigInteger)
+    endpoint_url: Mapped[str] = mapped_column(String(512))
+    timeout_s: Mapped[int] = mapped_column(Integer, default=60)
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)  # active | paused
+    calls_total: Mapped[int] = mapped_column(Integer, default=0)
+    calls_ok: Mapped[int] = mapped_column(Integer, default=0)
+    rating_sum: Mapped[int] = mapped_column(Integer, default=0)
+    rating_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    __table_args__ = (CheckConstraint("price_nanos > 0", name="ck_service_price_pos"),)
+
+
+class ServiceCall(Base):
+    """One paid call. The price is escrowed before the seller is called and is
+    either settled (success) or refunded (failure/timeout)."""
+
+    __tablename__ = "service_calls"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("call"))
+    service_id: Mapped[str] = mapped_column(ForeignKey("services.id"), index=True)
+    buyer_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    seller_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    price_nanos: Mapped[int] = mapped_column(BigInteger)
+    fee_nanos: Mapped[int] = mapped_column(BigInteger, default=0)
+    status: Mapped[str] = mapped_column(String(16), index=True)  # pending | succeeded | refunded
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    error: Mapped[str | None] = mapped_column(Text)
+    rating: Mapped[int | None] = mapped_column(Integer)
+    rating_comment: Mapped[str | None] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
