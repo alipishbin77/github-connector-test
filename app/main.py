@@ -13,12 +13,15 @@ from fastapi.staticfiles import StaticFiles
 from redis.asyncio import ConnectionPool, Redis
 from sqlalchemy import text
 
-from . import api, auth, crypto_payments, feedback, house, openai_compat, payments, proxy_router, services, site
+from . import api, auth, crypto_payments, feedback, house, mcp_server, openai_compat, payments, proxy_router, services, site
 from .config import settings
 from .db import engine as db_engine
 from .db import init_models
 from .exchange import SettlementWorker, reconcile_book, run_sweeps
 from .matching_engine import MatchingEngine
+from .mcp_server import mcp as mcp_marketplace
+
+mcp_app = mcp_marketplace.streamable_http_app(streamable_http_path="/", transport_security=mcp_server.build_transport_security())
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
 log = logging.getLogger("aether")
@@ -42,6 +45,21 @@ async def maintenance_loop(app: FastAPI) -> None:
 async def lifespan(app: FastAPI):
     auth.init_signing_key()
     await init_models()
+
+    # Run the MCP session manager as its own task, not entered/exited through this
+    # function's own task: its internal anyio task group requires being cancelled
+    # from within the same task it started in, which `asyncio.create_task` + cancel
+    # guarantees and a shared AsyncExitStack entered/exited across a session-scoped
+    # test fixture's setup/teardown does not.
+    mcp_ready = asyncio.Event()
+
+    async def _run_mcp() -> None:
+        async with mcp_marketplace.session_manager.run():
+            mcp_ready.set()
+            await asyncio.Event().wait()
+
+    mcp_task = asyncio.create_task(_run_mcp(), name="mcp-session-manager")
+    await mcp_ready.wait()
 
     pool = ConnectionPool.from_url(settings.redis_url, max_connections=settings.redis_max_connections, decode_responses=True)
     redis = Redis(connection_pool=pool)
@@ -67,6 +85,7 @@ async def lifespan(app: FastAPI):
     await reconcile_book(app.state.engine)
 
     tasks = [
+        mcp_task,
         asyncio.create_task(worker.run(), name="settlement-worker"),
         asyncio.create_task(maintenance_loop(app), name="maintenance"),
     ]
@@ -104,6 +123,7 @@ app = FastAPI(
     description="Agents trade abstracted inference units through an escrowed spot market; credentials never change hands.",
     lifespan=lifespan,
 )
+mcp_server.bind_app(app)  # MCP tools call back into this same app via an ASGI transport, not a network hop
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -123,6 +143,9 @@ app.include_router(feedback.router)
 app.include_router(site.router)
 # Brand assets only (logo, favicon, OG image) — small and static, no reason for a CDN yet.
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+# MCP server: the same service catalogue, reachable as native tool calls for any
+# MCP-client agent. Stateless proxy over the REST API above — see app/mcp_server.py.
+app.mount("/mcp", mcp_app)
 
 
 @app.get("/healthz", tags=["ops"])
