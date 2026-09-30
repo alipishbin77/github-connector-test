@@ -94,8 +94,13 @@ PRESETS: dict[str, Network] = {
                         "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", confirmations=12, max_block_range=500),
     "base": Network("base", "Base", 8453, "https://base-rpc.publicnode.com",
                     "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", confirmations=10, max_block_range=1000),
+    # max_block_range=40: publicnode's free Arbitrum endpoint answers eth_getLogs for a
+    # range up to ~50-99 blocks but returns "Archive requests require a personal token"
+    # above that (measured directly against the live endpoint 2026-09-30) — nothing to do
+    # with confirmations or how far behind the cursor is. 5000 here meant every poll
+    # since deploy failed and the deposit watcher never advanced at all.
     "arbitrum": Network("arbitrum", "Arbitrum One", 42161, "https://arbitrum-one-rpc.publicnode.com",
-                        "0xaf88d065e77c8cc2239327c5edb3a432268e5831", confirmations=240, max_block_range=5000),
+                        "0xaf88d065e77c8cc2239327c5edb3a432268e5831", confirmations=240, max_block_range=40),
     "optimism": Network("optimism", "OP Mainnet", 10, "https://optimism-rpc.publicnode.com",
                         "0x0b2c639c533813f4aa9d7837caf62653d097ff85", confirmations=10, max_block_range=1000),
     "polygon": Network("polygon", "Polygon PoS", 137, "https://polygon-bor-rpc.publicnode.com",
