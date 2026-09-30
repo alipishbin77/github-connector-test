@@ -306,11 +306,14 @@ def test_network_presets_and_json_config(monkeypatch):
     assert [n.key for n in cp.configured_networks()] == ["ethereum"]  # legacy single-network settings
 
 
-def test_arbitrum_max_block_range_stays_under_the_free_rpcs_archive_threshold():
-    """Regression guard: publicnode's free Arbitrum endpoint answers eth_getLogs up to
-    ~50-99 blocks, then refuses with "Archive requests require a personal token" above
-    that — measured directly against the live endpoint 2026-09-30. A range at or above
-    that threshold means the deposit watcher fails on every single poll and the cursor
-    never advances (confirmed: it sat ~455k blocks behind for as long as this had been
-    deployed). Keep meaningful margin below the measured ~50 floor."""
-    assert cp.PRESETS["arbitrum"].max_block_range <= 45
+def test_arbitrum_uses_a_getlogs_endpoint_without_the_archive_restriction():
+    """Regression guard: publicnode's free Arbitrum endpoint refuses eth_getLogs with
+    "Archive requests require a personal token" whenever toBlock is more than ~50-100
+    blocks behind its live head — measured directly 2026-09-30. Since `safe` is always
+    confirmations(240) blocks behind head by design, every query against that endpoint
+    was structurally unreachable: the deposit watcher failed on every single poll and
+    the cursor sat ~455k blocks behind for as long as this had been deployed. Arbitrum's
+    own public RPC has no such restriction, just a 10,000-matched-logs cap per call."""
+    net = cp.PRESETS["arbitrum"]
+    assert "publicnode.com" not in net.rpc_url
+    assert net.max_block_range <= 2000  # comfortably under the 10k-log cap at USDC volume

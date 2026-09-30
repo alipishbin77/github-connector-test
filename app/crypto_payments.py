@@ -94,13 +94,17 @@ PRESETS: dict[str, Network] = {
                         "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", confirmations=12, max_block_range=500),
     "base": Network("base", "Base", 8453, "https://base-rpc.publicnode.com",
                     "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", confirmations=10, max_block_range=1000),
-    # max_block_range=40: publicnode's free Arbitrum endpoint answers eth_getLogs for a
-    # range up to ~50-99 blocks but returns "Archive requests require a personal token"
-    # above that (measured directly against the live endpoint 2026-09-30) — nothing to do
-    # with confirmations or how far behind the cursor is. 5000 here meant every poll
-    # since deploy failed and the deposit watcher never advanced at all.
-    "arbitrum": Network("arbitrum", "Arbitrum One", 42161, "https://arbitrum-one-rpc.publicnode.com",
-                        "0xaf88d065e77c8cc2239327c5edb3a432268e5831", confirmations=240, max_block_range=40),
+    # publicnode's free Arbitrum endpoint refuses eth_getLogs with "Archive requests
+    # require a personal token" for any query whose *toBlock* is more than roughly
+    # 50-100 blocks behind its live head — measured directly 2026-09-30, true regardless
+    # of range width. Since `safe` is always confirmations(240) blocks behind head by
+    # design, every query against that endpoint was structurally in "archive" territory;
+    # the deposit watcher had failed on every single poll since deploy and the cursor
+    # never advanced. Arbitrum's own public RPC has no such restriction (verified), just
+    # a 10,000-matched-logs cap per call — max_block_range=500 keeps comfortably under
+    # that at USDC's transfer volume (~2,700 logs/1000 blocks measured).
+    "arbitrum": Network("arbitrum", "Arbitrum One", 42161, "https://arb1.arbitrum.io/rpc",
+                        "0xaf88d065e77c8cc2239327c5edb3a432268e5831", confirmations=240, max_block_range=500),
     "optimism": Network("optimism", "OP Mainnet", 10, "https://optimism-rpc.publicnode.com",
                         "0x0b2c639c533813f4aa9d7837caf62653d097ff85", confirmations=10, max_block_range=1000),
     "polygon": Network("polygon", "Polygon PoS", 137, "https://polygon-bor-rpc.publicnode.com",

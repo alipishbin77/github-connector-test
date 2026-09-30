@@ -241,6 +241,7 @@ async def test_portfolio_reads_native_and_token_balances(client, house, web):
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": result})
 
     web.responses["/"] = rpc
+    web.responses["/rpc"] = rpc  # arbitrum's PRESETS entry is arb1.arbitrum.io/rpc, not path "/"
 
     r = await invoke(client, house, "portfolio", {"address": address, "networks": ["base", "arbitrum"]})
 
@@ -265,7 +266,7 @@ async def test_portfolio_reads_native_and_token_balances(client, house, web):
         assert token["balance_units"] == 5_000_000
 
     hosts = {host for host, _ in calls}
-    assert hosts == {"base-rpc.publicnode.com", "arbitrum-one-rpc.publicnode.com"}
+    assert hosts == {"base-rpc.publicnode.com", "arb1.arbitrum.io"}
     # native + USDC + WETH per network, exactly the capped allowlist, no more.
     assert len(calls) == 2 * (1 + len(app_house.TOKEN_ALLOWLIST["base"]))
 
@@ -276,6 +277,7 @@ async def test_portfolio_defaults_to_every_configured_network(client, house, web
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": "0x0"})
 
     web.responses["/"] = rpc
+    web.responses["/rpc"] = rpc  # arbitrum's PRESETS entry is arb1.arbitrum.io/rpc, not path "/"
 
     r = await invoke(client, house, "portfolio", {"address": "0x" + "11" * 20})
 
@@ -288,12 +290,13 @@ async def test_portfolio_reports_per_asset_failure_without_5xx(client, house, we
     """One chain's dead RPC must not cost the buyer the rest of the portfolio."""
 
     def rpc(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "arbitrum-one-rpc.publicnode.com":
+        if request.url.host == "arb1.arbitrum.io":
             return httpx.Response(500, text="rpc down")
         payload = json.loads(request.content)
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": "0x0"})
 
     web.responses["/"] = rpc
+    web.responses["/rpc"] = rpc  # arbitrum's PRESETS entry is arb1.arbitrum.io/rpc, not path "/"
 
     r = await invoke(client, house, "portfolio", {"address": "0x" + "22" * 20, "networks": ["base", "arbitrum"]})
 
@@ -349,6 +352,7 @@ async def test_portfolio_cache_key_is_independent_of_network_order(client, house
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": "0x0"})
 
     web.responses["/"] = rpc
+    web.responses["/rpc"] = rpc  # arbitrum's PRESETS entry is arb1.arbitrum.io/rpc, not path "/"
 
     r1 = await invoke(client, house, "portfolio", {"address": address, "networks": ["base", "arbitrum"]}, call_id="order-c1")
     assert r1.status_code == 200, r1.text

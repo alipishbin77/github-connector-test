@@ -40,7 +40,7 @@ https://appp.tail1cb552.ts.net.
    |---|---|
    | ethereum | https://ethereum-rpc.publicnode.com |
    | base | https://base-rpc.publicnode.com |
-   | arbitrum | https://arbitrum-one-rpc.publicnode.com |
+   | arbitrum | https://arb1.arbitrum.io/rpc (publicnode's free tier refuses eth_getLogs more than ~50-100 blocks behind its head — confirmed 2026-09-30, broke deposit detection entirely) |
    | optimism | https://optimism-rpc.publicnode.com |
    | polygon | https://polygon-bor-rpc.publicnode.com |
 
