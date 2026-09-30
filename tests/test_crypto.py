@@ -304,3 +304,13 @@ def test_network_presets_and_json_config(monkeypatch):
     monkeypatch.setattr(settings, "crypto_chain_name", "Ethereum")
     monkeypatch.setattr(settings, "crypto_chain_id", 1)
     assert [n.key for n in cp.configured_networks()] == ["ethereum"]  # legacy single-network settings
+
+
+def test_arbitrum_max_block_range_stays_under_the_free_rpcs_archive_threshold():
+    """Regression guard: publicnode's free Arbitrum endpoint answers eth_getLogs up to
+    ~50-99 blocks, then refuses with "Archive requests require a personal token" above
+    that — measured directly against the live endpoint 2026-09-30. A range at or above
+    that threshold means the deposit watcher fails on every single poll and the cursor
+    never advances (confirmed: it sat ~455k blocks behind for as long as this had been
+    deployed). Keep meaningful margin below the measured ~50 floor."""
+    assert cp.PRESETS["arbitrum"].max_block_range <= 45
