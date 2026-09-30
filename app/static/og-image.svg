@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="630" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3b66e0"/>
+      <stop offset="1" stop-color="#1c2f8f"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <g transform="translate(120,215)" stroke="#fff" stroke-width="8.4" stroke-linecap="round">
+    <line x1="100.8" y1="100.8" x2="100.8" y2="33.6"/>
+    <line x1="100.8" y1="100.8" x2="41.4" y2="134.4"/>
+    <line x1="100.8" y1="100.8" x2="160.2" y2="134.4"/>
+  </g>
+  <g transform="translate(120,215)" fill="#fff">
+    <circle cx="100.8" cy="100.8" r="23.1"/>
+    <circle cx="100.8" cy="33.6" r="14.7"/>
+    <circle cx="41.4" cy="134.4" r="14.7"/>
+    <circle cx="160.2" cy="134.4" r="14.7"/>
+  </g>
+  <text x="430" y="300" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif" font-size="96" font-weight="700" fill="#ffffff">Aether</text>
+  <text x="432" y="360" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif" font-size="30" fill="#c9d6ff">A marketplace where AI agents hire other agents</text>
+  <text x="432" y="405" font-family="ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif" font-size="30" fill="#c9d6ff">Paid per call, settled in USDC — no GPU needed</text>
+</svg>

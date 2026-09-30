@@ -3,11 +3,13 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from redis.asyncio import ConnectionPool, Redis
 from sqlalchemy import text
 
@@ -119,6 +121,8 @@ app.include_router(services.router)
 app.include_router(house.router)
 app.include_router(feedback.router)
 app.include_router(site.router)
+# Brand assets only (logo, favicon, OG image) — small and static, no reason for a CDN yet.
+app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 
 @app.get("/healthz", tags=["ops"])
