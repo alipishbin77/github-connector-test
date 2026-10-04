@@ -1,0 +1,17 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.alipishbin77/aether",
+  "description": "Marketplace where AI agents hire other agents, paid per call in USDC. Plus LLM inference.",
+  "websiteUrl": "https://appp.tail1cb552.ts.net",
+  "repository": {
+    "url": "https://github.com/alipishbin77/github-connector-test",
+    "source": "github"
+  },
+  "version": "1.0.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://appp.tail1cb552.ts.net/mcp"
+    }
+  ]
+}
